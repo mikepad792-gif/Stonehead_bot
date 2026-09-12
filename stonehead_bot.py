@@ -1,0 +1,203 @@
+"""
+StoneHead Discord bot — v1.
+
+One command: /strain <name>. Calls api/strain-lookup on stoneheadai.com and
+returns StoneHead's answer as an embed. No memory, no vibe tab, no accounts.
+
+The bot is marketing. It's free, there's no signup, and the thing worth making
+an account for (vibe, memory) is the part a public channel can't hold anyway.
+
+Setup:
+    pip install discord.py aiohttp
+    export DISCORD_TOKEN="..."
+    export STONEHEAD_BOT_SECRET="..."      # must match BOT_SHARED_SECRET
+    export STONEHEAD_API="https://stoneheadai.com/api/strain-lookup"
+    python stonehead_bot.py
+
+Install by hand, per server, with permission from the owner. Do not list in
+the App Directory — you can't control who's typing in a server you don't run.
+"""
+
+import os
+import asyncio
+import logging
+
+import aiohttp
+import discord
+from discord import app_commands
+
+# ---------------------------------------------------------------- config
+
+API_URL = os.environ.get("STONEHEAD_API", "https://stoneheadai.com/api/strain-lookup")
+BOT_SECRET = os.environ.get("STONEHEAD_BOT_SECRET", "")
+SITE_URL = "https://stoneheadai.com"
+
+# Discord's own limits.
+EMBED_DESCRIPTION_MAX = 4096
+REPLY_SOFT_MAX = 1400          # keep it readable in a busy channel
+
+# Client-side timeout. The endpoint itself is bounded by Netlify's 10s.
+REQUEST_TIMEOUT = 12
+
+GREEN = 0x4A7C4E
+
+# Only respond in channels flagged age-restricted, or in DMs. Servers where
+# the owner hasn't age-gated anything get nothing — the app controls its own
+# age gate, and in someone else's server this is the only lever there is.
+REQUIRE_AGE_RESTRICTED = True
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("stonehead")
+
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+session: aiohttp.ClientSession | None = None
+
+
+# ---------------------------------------------------------------- helpers
+
+def channel_allows(interaction: discord.Interaction) -> bool:
+    """Age-restricted channels and DMs only."""
+    if not REQUIRE_AGE_RESTRICTED:
+        return True
+    channel = interaction.channel
+    if channel is None or isinstance(channel, discord.DMChannel):
+        return True
+    return bool(getattr(channel, "nsfw", False))
+
+
+def trim(text: str) -> str:
+    """Cut to something a channel can absorb, on a sentence boundary."""
+    text = text.strip()
+    if len(text) <= REPLY_SOFT_MAX:
+        return text[:EMBED_DESCRIPTION_MAX]
+
+    cut = text[:REPLY_SOFT_MAX]
+    for mark in (". ", "! ", "? ", "\n"):
+        idx = cut.rfind(mark)
+        if idx > REPLY_SOFT_MAX * 0.6:
+            return cut[: idx + 1].strip()
+    return cut.rstrip() + "…"
+
+
+async def ask_stonehead(query: str, user_id: str, guild_id: str | None):
+    """POST to the lookup endpoint. Returns (reply, matched) or raises."""
+    assert session is not None
+    payload = {
+        "query": query,
+        "discord_user_id": str(user_id),
+        "guild_id": str(guild_id) if guild_id else None,
+    }
+    headers = {"X-Bot-Secret": BOT_SECRET, "Content-Type": "application/json"}
+
+    async with session.post(
+        API_URL,
+        json=payload,
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+    ) as res:
+        if res.status == 429:
+            raise RateLimited()
+        if res.status == 401:
+            log.error("endpoint rejected the shared secret — check STONEHEAD_BOT_SECRET")
+            raise Unavailable()
+        if res.status != 200:
+            body = (await res.text())[:200]
+            log.error("lookup failed status=%s body=%s", res.status, body)
+            raise Unavailable()
+
+        data = await res.json()
+        reply = (data.get("reply") or "").strip()
+        if not reply:
+            raise Unavailable()
+        return reply, bool(data.get("matched"))
+
+
+class RateLimited(Exception):
+    pass
+
+
+class Unavailable(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- command
+
+@tree.command(name="strain", description="Ask StoneHead about a strain")
+@app_commands.describe(name="Strain name — e.g. blue dream, chem's sister")
+async def strain(interaction: discord.Interaction, name: str):
+    if not channel_allows(interaction):
+        await interaction.response.send_message(
+            "This one only works in age-restricted channels. A mod can flag a "
+            "channel 18+ in its settings.",
+            ephemeral=True,
+        )
+        return
+
+    name = name.strip()
+    if not name:
+        await interaction.response.send_message("Give me a strain name.", ephemeral=True)
+        return
+    if len(name) > 200:
+        await interaction.response.send_message("That's a long one — shorten it up.", ephemeral=True)
+        return
+
+    # The model call can take several seconds; defer or Discord times out at 3.
+    await interaction.response.defer()
+
+    try:
+        reply, matched = await ask_stonehead(
+            name,
+            interaction.user.id,
+            interaction.guild_id,
+        )
+    except RateLimited:
+        await interaction.followup.send(
+            "Easy — give it a few minutes and ask again.", ephemeral=True
+        )
+        return
+    except (Unavailable, asyncio.TimeoutError, aiohttp.ClientError):
+        await interaction.followup.send(
+            f"He's not answering right now. Try again in a bit, or come find him at {SITE_URL}",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=name if matched else f"{name} — no match",
+        description=trim(reply),
+        color=GREEN,
+    )
+    embed.set_footer(text=f"StoneHead AI · full conversations at {SITE_URL.replace('https://', '')}")
+
+    await interaction.followup.send(embed=embed)
+    log.info(
+        "strain lookup guild=%s user=%s query=%r matched=%s",
+        interaction.guild_id, interaction.user.id, name, matched,
+    )
+
+
+# ---------------------------------------------------------------- lifecycle
+
+@client.event
+async def on_ready():
+    global session
+    if session is None:
+        session = aiohttp.ClientSession()
+    await tree.sync()
+    log.info("connected as %s — in %d servers", client.user, len(client.guilds))
+
+
+def main():
+    token = os.environ.get("DISCORD_TOKEN")
+    if not token:
+        raise SystemExit("set DISCORD_TOKEN")
+    if not BOT_SECRET:
+        raise SystemExit("set STONEHEAD_BOT_SECRET (must match BOT_SHARED_SECRET on the API)")
+    client.run(token)
+
+
+if __name__ == "__main__":
+    main()
