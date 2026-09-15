@@ -1,0 +1,18 @@
+# StoneHead Discord bot — runtime dependencies.
+#
+# bot-hosting.net (and any other Pterodactyl-based panel) installs from this
+# file on boot, so it has to list everything the bot imports.
+
+# 2.x is required, not optional: app_commands / slash commands do not exist in
+# discord.py 1.x, and the whole bot is one slash command.
+discord.py>=2.3,<3
+
+# discord.py already pulls aiohttp in, but stonehead_bot.py imports it directly
+# for its own ClientSession — so it is a direct dependency and gets pinned here
+# rather than inherited by luck.
+aiohttp>=3.9,<4
+
+# Optional. Lets secrets live in a .env file next to the bot for panels whose
+# free tier gives you a file manager but no environment-variable editor.
+# stonehead_bot.py works without it — see the try/except around the import.
+python-dotenv>=1.0,<2

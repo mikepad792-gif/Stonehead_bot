@@ -8,11 +8,13 @@ The bot is marketing. It's free, there's no signup, and the thing worth making
 an account for (vibe, memory) is the part a public channel can't hold anyway.
 
 Setup:
-    pip install discord.py aiohttp
-    export DISCORD_TOKEN="..."
-    export STONEHEAD_BOT_SECRET="..."      # must match BOT_SHARED_SECRET
-    export STONEHEAD_API="https://stoneheadai.com/api/strain-lookup"
+    pip install -r requirements.txt
+    cp .env.example .env     # then fill it in
     python stonehead_bot.py
+
+Deploying it somewhere that stays up: see DEPLOY in README.md. It holds a
+websocket to Discord's gateway, so it needs an always-on process — a serverless
+function cannot host it.
 
 Install by hand, per server, with permission from the owner. Do not list in
 the App Directory — you can't control who's typing in a server you don't run.
@@ -25,6 +27,18 @@ import logging
 import aiohttp
 import discord
 from discord import app_commands
+
+# Secrets come from the environment. Some panels — bot-hosting.net and other
+# Pterodactyl hosts among them — give you a file manager more readily than an
+# environment-variable editor, so a .env sitting next to this file is read too.
+# Optional by design: a real environment variable always wins, and the bot runs
+# fine when python-dotenv isn't installed.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
+except ImportError:
+    pass
 
 # ---------------------------------------------------------------- config
 
