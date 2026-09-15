@@ -26,6 +26,12 @@ the honest-miss rule, the crisis and substance intercepts, and the age floor
 all live server-side in the StoneHead repo — so they cannot be bypassed by
 anyone running a modified copy of this file.
 
+**The AI model is not configured here either.** The bot never talks to
+OpenRouter; it POSTs a strain name and renders what comes back. Which model
+answers is `AI_MODEL_BOT` in the site's Netlify environment (blank inherits
+`AI_MODEL`). There is nothing to set on the bot host — the only two variables
+that belong there are `DISCORD_TOKEN` and `STONEHEAD_BOT_SECRET`.
+
 ## Before it will answer anything
 
 Both halves have to be in place, and they share one secret:
