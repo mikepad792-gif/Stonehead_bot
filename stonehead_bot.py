@@ -174,7 +174,7 @@ class Unavailable(Exception):
 # ---------------------------------------------------------------- command
 
 @tree.command(name="strain", description="Ask StoneHead about a strain")
-@app_commands.describe(name="Strain name — e.g. blue dream, chem's sister")
+@app_commands.describe(name="Strain name, e.g. blue dream, chem's sister")
 async def strain(interaction: discord.Interaction, name: str):
     if not channel_allows(interaction):
         await interaction.response.send_message(
@@ -189,7 +189,7 @@ async def strain(interaction: discord.Interaction, name: str):
         await interaction.response.send_message("Give me a strain name.", ephemeral=True)
         return
     if len(name) > 200:
-        await interaction.response.send_message("That's a long one — shorten it up.", ephemeral=True)
+        await interaction.response.send_message("That's a long one, shorten it up.", ephemeral=True)
         return
 
     # The model call can take several seconds; defer or Discord times out at 3.
@@ -203,7 +203,7 @@ async def strain(interaction: discord.Interaction, name: str):
         )
     except RateLimited:
         await interaction.followup.send(
-            "Easy — give it a few minutes and ask again.", ephemeral=True
+            "Easy. Give it a few minutes and ask again.", ephemeral=True
         )
         return
     except (Unavailable, asyncio.TimeoutError, aiohttp.ClientError):
@@ -214,7 +214,7 @@ async def strain(interaction: discord.Interaction, name: str):
         return
 
     embed = discord.Embed(
-        title=name if matched else f"{name} — no match",
+        title=name if matched else f"{name} (no match)",
         description=trim(reply),
         color=GREEN,
     )
