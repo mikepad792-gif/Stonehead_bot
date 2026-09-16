@@ -98,6 +98,22 @@ def channel_allows(interaction: discord.Interaction) -> bool:
     return bool(check()) if callable(check) else False
 
 
+def add_field(embed: discord.Embed, label: str, value) -> None:
+    """Add an inline field, or nothing at all when the value is absent.
+
+    Skipping rather than showing a blank is what lets a partial record still
+    render as a finished card. Roughly 4% of the database has no effects and
+    7% no flavour, and an unrated strain carries a rating of 0 — "Rating: 0/5"
+    reads as a terrible strain rather than one nobody scored.
+    """
+    if isinstance(value, (list, tuple)):
+        value = ", ".join(str(item).strip() for item in value if str(item).strip())
+    elif value is not None:
+        value = str(value).strip()
+    if value:
+        embed.add_field(name=label, value=value, inline=True)
+
+
 def trim(text: str) -> str:
     """Cut to something a channel can absorb, on a sentence boundary."""
     text = text.strip()
@@ -113,7 +129,7 @@ def trim(text: str) -> str:
 
 
 async def ask_stonehead(query: str, user_id: str, guild_id: str | None):
-    """POST to the lookup endpoint. Returns (reply, matched) or raises."""
+    """POST to the lookup endpoint. Returns (reply, matched, strain_data) or raises."""
     assert session is not None
     payload = {
         "query": query,
@@ -142,7 +158,9 @@ async def ask_stonehead(query: str, user_id: str, guild_id: str | None):
         reply = (data.get("reply") or "").strip()
         if not reply:
             raise Unavailable()
-        return reply, bool(data.get("matched"))
+        # strain_data is absent on every safety reply and on older deploys of
+        # the endpoint, so .get() returning None is a normal state, not a fault.
+        return reply, bool(data.get("matched")), data.get("strain_data")
 
 
 class RateLimited(Exception):
@@ -178,7 +196,7 @@ async def strain(interaction: discord.Interaction, name: str):
     await interaction.response.defer()
 
     try:
-        reply, matched = await ask_stonehead(
+        reply, matched, strain_data = await ask_stonehead(
             name,
             interaction.user.id,
             interaction.guild_id,
@@ -200,6 +218,21 @@ async def strain(interaction: discord.Interaction, name: str):
         description=trim(reply),
         color=GREEN,
     )
+    # Structured fields only when the endpoint sent a record — a miss, a safety
+    # reply, and an older endpoint deploy all arrive as None and leave the
+    # embed exactly as it was before.
+    if strain_data:
+        add_field(embed, "Type", strain_data.get("type"))
+        add_field(embed, "Effects", strain_data.get("effects"))
+        add_field(embed, "Flavour", strain_data.get("flavor"))
+        rating = strain_data.get("rating")
+        add_field(embed, "Rating", f"{rating}/5" if rating else None)
+
+    # The bot's own avatar. An embed with no image reads as a wall of text
+    # beside one that has a thumbnail, and this costs nothing to carry.
+    if client.user is not None:
+        embed.set_thumbnail(url=client.user.display_avatar.url)
+
     embed.set_footer(text=f"StoneHead AI · full conversations at {SITE_URL.replace('https://', '')}")
 
     await interaction.followup.send(embed=embed)
