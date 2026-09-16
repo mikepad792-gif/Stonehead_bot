@@ -58,7 +58,12 @@ GREEN = 0x4A7C4E
 # Only respond in channels flagged age-restricted, or in DMs. Servers where
 # the owner hasn't age-gated anything get nothing — the app controls its own
 # age gate, and in someone else's server this is the only lever there is.
-REQUIRE_AGE_RESTRICTED = True
+#
+# Env-overridable for local and staging runs, where no real server is on the
+# other end. The default is ON and ONLY the exact string "0" turns it off, so
+# a missing, empty, or fat-fingered value keeps the gate closed — forgetting
+# this variable can never open it. Never set it to 0 in a server you don't own.
+REQUIRE_AGE_RESTRICTED = os.environ.get("REQUIRE_AGE_RESTRICTED", "1") != "0"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("stonehead")
@@ -68,6 +73,7 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 session: aiohttp.ClientSession | None = None
+commands_synced = False
 
 
 # ---------------------------------------------------------------- helpers
@@ -79,7 +85,17 @@ def channel_allows(interaction: discord.Interaction) -> bool:
     channel = interaction.channel
     if channel is None or isinstance(channel, discord.DMChannel):
         return True
-    return bool(getattr(channel, "nsfw", False))
+    # is_nsfw() rather than the .nsfw attribute. discord.Thread has no .nsfw
+    # at all, so reading the attribute refused every thread — including
+    # threads inside a channel the owner HAD age-restricted, which is the
+    # case the gate is supposed to allow. The method exists on threads and
+    # reads the parent channel's flag, which is the real answer.
+    #
+    # A channel type without the method (PartialMessageable, anything
+    # uncached) falls through to False. Unknown is not permitted: the whole
+    # point of this gate is that it holds in servers we don't run.
+    check = getattr(channel, "is_nsfw", None)
+    return bool(check()) if callable(check) else False
 
 
 def trim(text: str) -> str:
@@ -197,10 +213,16 @@ async def strain(interaction: discord.Interaction, name: str):
 
 @client.event
 async def on_ready():
-    global session
+    global session, commands_synced
     if session is None:
         session = aiohttp.ClientSession()
-    await tree.sync()
+    # Once per PROCESS, not once per connect. on_ready fires again on every
+    # gateway resume, and a global command sync is rate limited — on a host
+    # that reconnects often, re-syncing here is a steady drip of identical
+    # calls against the limit that exists to stop exactly that.
+    if not commands_synced:
+        await tree.sync()
+        commands_synced = True
     log.info("connected as %s — in %d servers", client.user, len(client.guilds))
 
 

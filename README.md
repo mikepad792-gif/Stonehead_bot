@@ -102,9 +102,31 @@ variables, and keep the process alive with a restart-on-failure policy.
 
 ## Where it will and won't talk
 
-`REQUIRE_AGE_RESTRICTED = True` — it answers in DMs and in channels a server
-has flagged age-restricted, and nowhere else. In a server you don't run, that
-flag is the only lever you have over who is typing, so it stays on.
+The age gate is **on by default**: the bot answers in DMs and in channels a
+server has flagged age-restricted, and nowhere else. In a server you don't
+run, that flag is the only lever you have over who is typing, so it stays on.
+
+**Threads inherit their parent channel's age restriction and cannot be gated
+on their own.** Discord has no per-thread age flag, so a thread is answerable
+exactly when the channel it lives in is age-restricted. Flag the channel and
+its threads follow; there is no way to open one thread without the rest.
+
+`REQUIRE_AGE_RESTRICTED=0` turns the gate off, **for local and staging testing
+only**. Only the exact string `0` disables it — blank, `false`, `no` and
+anything else leave it on, so a typo can't quietly open the gate. Never set it
+to 0 in a server that isn't yours.
+
+## Environment variables
+
+| Variable | |
+|---|---|
+| `DISCORD_TOKEN` | **Required.** Bot token from the Discord developer portal. |
+| `STONEHEAD_BOT_SECRET` | **Required.** Must match `BOT_SHARED_SECRET` in the site's Netlify environment. |
+| `STONEHEAD_API` | Optional. Defaults to the production endpoint; override for a deploy preview or `netlify dev`. |
+| `REQUIRE_AGE_RESTRICTED` | Optional. Defaults to on. `0` disables the age gate — testing only. |
+
+That's the whole list. In particular there is **no model setting here** — see
+the note above on where that lives.
 
 Install it by hand, per server, with the owner's permission. Do not list it in
 the App Directory.
