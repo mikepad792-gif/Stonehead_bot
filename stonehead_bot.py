@@ -114,6 +114,16 @@ def add_field(embed: discord.Embed, label: str, value) -> None:
         embed.add_field(name=label, value=value, inline=True)
 
 
+def strain_title(raw: str) -> str:
+    """Turn a dataset key into something that reads as a name.
+
+    The strain database is keyed with hyphens for spaces, so the endpoint
+    answers with "Northern-Lights". A title is read, not clicked.
+    """
+    pretty = raw.replace("-", " ").strip()
+    return pretty or raw
+
+
 def trim(text: str) -> str:
     """Cut to something a channel can absorb, on a sentence boundary."""
     text = text.strip()
@@ -129,7 +139,7 @@ def trim(text: str) -> str:
 
 
 async def ask_stonehead(query: str, user_id: str, guild_id: str | None):
-    """POST to the lookup endpoint. Returns (reply, matched, strain_data) or raises."""
+    """POST to the lookup endpoint. Returns (reply, matched, strain, strain_data)."""
     assert session is not None
     payload = {
         "query": query,
@@ -158,9 +168,15 @@ async def ask_stonehead(query: str, user_id: str, guild_id: str | None):
         reply = (data.get("reply") or "").strip()
         if not reply:
             raise Unavailable()
-        # strain_data is absent on every safety reply and on older deploys of
-        # the endpoint, so .get() returning None is a normal state, not a fault.
-        return reply, bool(data.get("matched")), data.get("strain_data")
+        # strain and strain_data are both absent on every safety reply and on
+        # older deploys of the endpoint, so .get() returning None is a normal
+        # state, not a fault.
+        return (
+            reply,
+            bool(data.get("matched")),
+            data.get("strain"),
+            data.get("strain_data"),
+        )
 
 
 class RateLimited(Exception):
@@ -196,7 +212,7 @@ async def strain(interaction: discord.Interaction, name: str):
     await interaction.response.defer()
 
     try:
-        reply, matched, strain_data = await ask_stonehead(
+        reply, matched, answered, strain_data = await ask_stonehead(
             name,
             interaction.user.id,
             interaction.guild_id,
@@ -213,8 +229,14 @@ async def strain(interaction: discord.Interaction, name: str):
         )
         return
 
+    # The title names the strain IN THE CARD, never the one that was typed.
+    # The endpoint now answers a miss with a different strain and says so in
+    # the reply, so a title echoing the query would label that body with a
+    # name it never describes — the one mismatch nobody downstream can catch.
+    # Nothing to name (a safety reply, an older endpoint deploy) falls back to
+    # the query, which is the only strain either side knows about.
     embed = discord.Embed(
-        title=name if matched else f"{name} (no match)",
+        title=strain_title(answered) if answered else name,
         description=trim(reply),
         color=GREEN,
     )
@@ -237,8 +259,8 @@ async def strain(interaction: discord.Interaction, name: str):
 
     await interaction.followup.send(embed=embed)
     log.info(
-        "strain lookup guild=%s user=%s query=%r matched=%s",
-        interaction.guild_id, interaction.user.id, name, matched,
+        "strain lookup guild=%s user=%s query=%r matched=%s answered=%s",
+        interaction.guild_id, interaction.user.id, name, matched, answered,
     )
 
 
