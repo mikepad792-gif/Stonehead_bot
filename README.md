@@ -7,6 +7,11 @@ One slash command, `/strain <name>`. It posts the name to
 embed. No memory, no vibe tab, no accounts — those live on the site, behind a
 login, which is the point.
 
+Every card it posts carries a 🔁 reaction. Tapping it gets a different strain
+with a close profile. **The strain is chosen server-side from a precomputed
+table, never by the model** — a model asked for "something similar" reliably
+names a strain that was never in the database.
+
 ## How it fits together
 
 ```
@@ -18,7 +23,17 @@ Discord  ──/strain blue dream──>  stonehead_bot.py   (always-on process)
                                         │
                                         │  strain DB + safety layers + model
                                         v
-                                   { reply, matched, strain }
+                          { reply, matched, strain, tier, strain_data }
+
+Discord  ──🔁 on a card─────>  stonehead_bot.py
+                                        │
+                                        │  POST, mode: "similar", source_strain
+                                        v
+                          stoneheadai.com/api/strain-lookup
+                                        │
+                                        │  precomputed neighbour table, then model
+                                        v
+                          { reply, strain, source_strain, strain_data }
 ```
 
 The bot itself holds no data and makes no decisions about content. Retrieval,
@@ -37,8 +52,8 @@ that belong there are `DISCORD_TOKEN` and `STONEHEAD_BOT_SECRET`.
 Both halves have to be in place, and they share one secret:
 
 1. **The endpoint is deployed** — `api/strain-lookup.js` in the StoneHead repo,
-   with the `/api/strain-lookup` redirect in `netlify.toml` and migration
-   `012_bot_usage.sql` applied to the database.
+   with the `/api/strain-lookup` redirect in `netlify.toml` and migrations
+   `012_bot_usage.sql` and `013_bot_user_state.sql` applied to the database.
 2. **`BOT_SHARED_SECRET`** is set in the site's Netlify environment.
 3. **`STONEHEAD_BOT_SECRET`** here is set to *the same value*.
 
@@ -115,6 +130,21 @@ its threads follow; there is no way to open one thread without the rest.
 only**. Only the exact string `0` disables it — blank, `false`, `no` and
 anything else leave it on, so a typo can't quietly open the gate. Never set it
 to 0 in a server that isn't yours.
+
+## Permissions it needs
+
+Invite it with **Send Messages**, **Embed Links**, **Read Message History** and
+**Add Reactions**.
+
+- *Embed Links* — without it every answer is silently dropped, since the bot
+  only ever posts embeds.
+- *Add Reactions* — without it the cards still post, just with no 🔁 to tap.
+  The bot logs that and carries on rather than failing the command.
+- *Read Message History* — lets the recommendation land as a reply to the card
+  it came from instead of as a loose message below it.
+
+No privileged intents. The bot never reads message content; it sees slash
+commands and reactions, both of which Discord sends without one.
 
 ## Environment variables
 
