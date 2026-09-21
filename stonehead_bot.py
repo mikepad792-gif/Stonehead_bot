@@ -4,6 +4,10 @@ StoneHead Discord bot — v1.
 One command: /strain <name>. Calls api/strain-lookup on stoneheadai.com and
 returns StoneHead's answer as an embed. No memory, no vibe tab, no accounts.
 
+A query naming a family rather than one strain ("thunder fuck og") comes back
+as a row of buttons, one per member the database holds. Picking one edits the
+list into that strain's card.
+
 Every card carries a 🔁 reaction: tapping it asks for a different strain with
 a close profile. That strain is chosen SERVER SIDE from a precomputed table of
 profile neighbours, not by the model, because a model asked for "something
@@ -230,7 +234,12 @@ async def offer_more(message: discord.Message | None, strain) -> None:
 
 
 async def ask_stonehead(query: str, user_id: str, guild_id: str | None):
-    """POST to the lookup endpoint. Returns (reply, matched, strain, strain_data)."""
+    """POST to the lookup endpoint. Returns the decoded body, or raises.
+
+    A dict rather than a tuple: the endpoint answers in tiers now, and a
+    family picker carries candidates where a card carries a record. Unpacking
+    a six-tuple at two call sites is how those get silently swapped.
+    """
     assert session is not None
     payload = {
         "query": query,
@@ -259,15 +268,17 @@ async def ask_stonehead(query: str, user_id: str, guild_id: str | None):
         reply = (data.get("reply") or "").strip()
         if not reply:
             raise Unavailable()
-        # strain and strain_data are both absent on every safety reply and on
-        # older deploys of the endpoint, so .get() returning None is a normal
-        # state, not a fault.
-        return (
-            reply,
-            bool(data.get("matched")),
-            data.get("strain"),
-            data.get("strain_data"),
-        )
+        # Every key below is absent on some real response — a safety reply has
+        # no strain, a card has no candidates, an older endpoint deploy has
+        # neither — so a missing key is a normal state, not a fault.
+        return {
+            "reply": reply,
+            "matched": bool(data.get("matched")),
+            "strain": data.get("strain"),
+            "strain_data": data.get("strain_data"),
+            "tier": data.get("tier"),
+            "candidates": data.get("candidates") or [],
+        }
 
 
 async def ask_similar(source_strain: str, user_id: str, guild_id: str | None):
@@ -324,6 +335,127 @@ class Unavailable(Exception):
     pass
 
 
+# ---------------------------------------------------------------- picker
+
+# How long the buttons stay live. A greyed-out row reads as expired, which is
+# a state people understand. The alternative — leaving them live forever —
+# means a button whose handler died on a restart, and a dead live button reads
+# as broken rather than as over.
+PICKER_TIMEOUT = 600  # 10 minutes
+
+
+class StrainPicker(discord.ui.View):
+    """One row of buttons, one per strain in the family the query could mean.
+
+    Native components rather than reactions, and that is the whole point: a
+    button labelled "Alaskan" needs no legend, where an emoji row needs
+    decoding before anybody can use it.
+
+    UNLIKE A REACTION, A BUTTON TAP IS A COMPONENT INTERACTION AND DOES HAVE
+    THE 3-SECOND ACK WINDOW. The lookup behind it takes several seconds, so
+    every handler defers first and edits after.
+    """
+
+    def __init__(self, candidates, requester_id: int, query: str):
+        super().__init__(timeout=PICKER_TIMEOUT)
+        self.requester_id = requester_id
+        self.query = query
+        self.message: discord.Message | None = None
+        for cand in candidates[:5]:
+            strain = cand.get("strain")
+            if not strain:
+                continue
+            label = (cand.get("label") or strain.replace("-", " "))[:80]
+            self.add_item(StrainPickButton(label=label, strain=strain))
+
+    async def on_timeout(self):
+        """Grey the row out. The list is over, and it should look over."""
+        for item in self.children:
+            item.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(view=self)
+        except discord.HTTPException:
+            pass  # deleted, or we lost access. Nothing to grey out.
+
+
+class StrainPickButton(discord.ui.Button):
+    def __init__(self, label: str, strain: str):
+        # Self-describing custom_id: the handler reads the strain off the
+        # button rather than looking it up in state it would have to keep.
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"pick:{strain}"[:100],
+        )
+        self.strain = strain
+
+    async def callback(self, interaction: discord.Interaction):
+        view: StrainPicker = self.view
+
+        # Requester only. In a busy channel the list belongs to whoever asked,
+        # and anyone else tapping it would spend THEIR hourly budget answering
+        # somebody else's question.
+        if interaction.user.id != view.requester_id:
+            await interaction.response.send_message(
+                "That one's for someone else. Run /strain and I'll sort you out.",
+                ephemeral=True,
+            )
+            return
+
+        # Defer against the 3-second window before the lookup starts.
+        await interaction.response.defer()
+
+        try:
+            answer = await ask_stonehead(
+                self.strain, interaction.user.id, interaction.guild_id
+            )
+        except RateLimited:
+            await interaction.followup.send(
+                "Easy. Give it a few minutes and ask again.", ephemeral=True
+            )
+            return
+        except (Unavailable, asyncio.TimeoutError, aiohttp.ClientError):
+            await interaction.followup.send(
+                f"He's not answering right now. Try again in a bit, or come find him at {SITE_URL}",
+                ephemeral=True,
+            )
+            return
+
+        answered = answer["strain"] or self.strain
+        embed = card_embed(
+            answer["reply"],
+            answered,
+            answer["strain_data"],
+            fallback_title=strain_title(self.strain),
+        )
+
+        # EDIT the list into the card rather than posting under it. The list
+        # existed to ask a question that has now been answered, and leaving it
+        # above the card invites a second tap on a question nobody is asking
+        # any more. Dropping the view takes the buttons with it.
+        view.stop()
+        message = view.message
+        try:
+            if message is not None:
+                await message.edit(content=None, embed=embed, view=None)
+            else:
+                message = await interaction.followup.send(embed=embed, wait=True)
+        except discord.HTTPException as err:
+            log.info("could not edit the picker into a card: %s", err)
+            return
+
+        # The card that comes out of a pick is a card like any other, so it
+        # carries the more-like-this button too. No special case.
+        await offer_more(message, answered)
+
+        log.info(
+            "strain pick guild=%s user=%s query=%r picked=%s",
+            interaction.guild_id, interaction.user.id, view.query, self.strain,
+        )
+
+
 # ---------------------------------------------------------------- command
 
 @tree.command(name="strain", description="Ask StoneHead about a strain")
@@ -349,11 +481,7 @@ async def strain(interaction: discord.Interaction, name: str):
     await interaction.response.defer()
 
     try:
-        reply, matched, answered, strain_data = await ask_stonehead(
-            name,
-            interaction.user.id,
-            interaction.guild_id,
-        )
+        answer = await ask_stonehead(name, interaction.user.id, interaction.guild_id)
     except RateLimited:
         await interaction.followup.send(
             "Easy. Give it a few minutes and ask again.", ephemeral=True
@@ -366,12 +494,30 @@ async def strain(interaction: discord.Interaction, name: str):
         )
         return
 
-    embed = card_embed(reply, answered, strain_data, fallback_title=name)
+    # A family the query could mean several members of. One line and a row of
+    # buttons instead of a card, because picking for them is the thing that
+    # went wrong before: "thunder fuck og" used to get "never heard of it"
+    # while the file held five of them.
+    if answer["tier"] == "family_picker" and answer["candidates"]:
+        view = StrainPicker(answer["candidates"], interaction.user.id, name)
+        view.message = await interaction.followup.send(
+            answer["reply"], view=view, wait=True
+        )
+        log.info(
+            "strain picker guild=%s user=%s query=%r candidates=%d",
+            interaction.guild_id, interaction.user.id, name,
+            len(answer["candidates"]),
+        )
+        return
+
+    answered = answer["strain"]
+    embed = card_embed(answer["reply"], answered, answer["strain_data"], fallback_title=name)
     message = await interaction.followup.send(embed=embed, wait=True)
     await offer_more(message, answered)
     log.info(
-        "strain lookup guild=%s user=%s query=%r matched=%s answered=%s",
-        interaction.guild_id, interaction.user.id, name, matched, answered,
+        "strain lookup guild=%s user=%s query=%r tier=%s matched=%s answered=%s",
+        interaction.guild_id, interaction.user.id, name,
+        answer["tier"], answer["matched"], answered,
     )
 
 
