@@ -23,6 +23,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import discord  # noqa: E402
 import stonehead_bot as B  # noqa: E402
 
+# The REAL client, captured before any fake replaces it. Event registration
+# happens at import, so this is the only moment it can be inspected.
+REAL_CLIENT = B.client
+
 FAILURES = []
 
 
@@ -656,6 +660,96 @@ run(B.on_raw_reaction_add(FakePayload(vs_card.id, emoji="\U0001F501\uFE0F")))
 check("P11g a variation-selector tap produces a recommendation",
       len(session.requests) - before == 1 and len(vs_card.replies) == 1,
       (len(session.requests) - before, vs_card.replies))
+
+# ── P12: a reaction event always leaves a mark ──────────────────────
+#
+# Every log line before this sat behind at least one check, so silence never
+# distinguished "the gateway delivered nothing" from "it delivered something a
+# check rejected". That ambiguity has cost four rounds of narrowing.
+print("\nP12  nothing arrives unseen")
+
+import logging  # noqa: E402
+
+class Capture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+cap = Capture()
+B.log.addHandler(cap)
+old_level = B.log.level
+B.log.setLevel(logging.DEBUG)
+
+traced = FakeMessage()
+react_channel.messages[traced.id] = traced
+B.client = FakeClient(react_channel)
+
+# An emoji that is not the button, on a message we have never registered.
+# Before this, that combination was completely silent.
+B.CARD_STRAINS.pop(traced.id, None)
+cap.lines.clear()
+run(B.on_raw_reaction_add(FakePayload(traced.id, emoji="\U0001F525")))
+check("P12a an unmatched emoji on an unknown message still traces",
+      any("raw reaction add" in line for line in cap.lines), cap.lines)
+check("P12b ...with the code points, so the comparison is checkable",
+      any("0x1f525" in line for line in cap.lines), cap.lines)
+
+# And a removal traces too, which is what separates "no events at all" from
+# "adds specifically are being eaten".
+cap.lines.clear()
+run(B.on_raw_reaction_remove(FakePayload(traced.id)))
+check("P12c a reaction REMOVE traces as well",
+      any("raw reaction remove" in line for line in cap.lines), cap.lines)
+
+B.log.setLevel(old_level)
+B.log.removeHandler(cap)
+
+# The trace must be off unless asked for, or a busy channel buries everything.
+check("P12d the trace is debug level, so it is silent by default",
+      B.log.level in (0, logging.INFO), B.log.level)
+
+# ── P13: the handlers are actually REGISTERED ───────────────────────
+#
+# THE BUG THIS EXISTS FOR, and every assertion in this file missed it.
+#
+# A helper was inserted between @client.event and the function it decorated.
+# The decorator bound to the HELPER, and on_raw_reaction_add was left plain --
+# still importable, still correct, still passing all 74 assertions above,
+# because they call it directly. discord.py never registered it, so the
+# gateway delivered reaction events to nothing at all.
+#
+# Four rounds of diagnostics went into a handler that was never wired up.
+# Testing behaviour is not the same as testing that the behaviour can be
+# reached, and only this check can tell the difference.
+print("\nP13  the wiring, not just the logic")
+
+for handler in ["on_ready", "on_raw_reaction_add", "on_raw_reaction_remove"]:
+    bound = getattr(REAL_CLIENT, handler, None)
+    check(
+        f"P13 {handler} is registered on the client",
+        bound is not None and bound is getattr(B, handler, None),
+        f"defined in the module: {hasattr(B, handler)}; bound on the client: {bound is not None}",
+    )
+
+# The other half of the same mistake: a decorator landing on something that is
+# not an event handler at all. discord.py registers by NAME, so it accepts it
+# silently and the helper simply never fires.
+stray = [
+    name for name in dir(REAL_CLIENT)
+    if not name.startswith("on_")
+    and getattr(B, name, None) is not None
+    and getattr(REAL_CLIENT, name, None) is getattr(B, name, None)
+    and callable(getattr(B, name))
+]
+check(
+    "P13 no module function is bound to the client by mistake",
+    stray == [],
+    f"these were decorated but are not events: {stray}",
+)
 
 print()
 if FAILURES:

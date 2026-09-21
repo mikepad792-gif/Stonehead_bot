@@ -67,7 +67,7 @@ REQUEST_TIMEOUT = 12
 # "restart" on a Pterodactyl panel reboots the process with whatever files are
 # already on disk — it does not pull. Without this there is no way to tell a
 # deployed fix from an undeployed one except by guessing at behaviour.
-BUILD = "2026-09-21-emoji-normalise"
+BUILD = "2026-09-21-register-handler"
 
 GREEN = 0x4A7C4E
 
@@ -113,6 +113,14 @@ REQUIRE_AGE_RESTRICTED = os.environ.get("REQUIRE_AGE_RESTRICTED", "1") != "0"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("stonehead")
+
+# Turn on the raw reaction trace. Off by default because a busy channel would
+# bury everything else; set LOG_REACTIONS=1 on the host when the button is
+# misbehaving and every reaction event that reaches the process is printed,
+# whatever it is.
+if os.environ.get("LOG_REACTIONS") == "1":
+    log.setLevel(logging.DEBUG)
+    log.info("LOG_REACTIONS=1 — every raw reaction event will be logged")
 
 # Reactions are in the default set; message content is not, and is not wanted.
 # The bot reads slash commands and reaction events, neither of which needs a
@@ -617,7 +625,6 @@ async def strain(interaction: discord.Interaction, name: str):
 
 # ---------------------------------------------------------------- reaction
 
-@client.event
 async def say_under_card(channel, message_id: int, text: str) -> None:
     """Answer a reaction in the channel, under the card it was tapped on.
 
@@ -638,6 +645,7 @@ async def say_under_card(channel, message_id: int, text: str) -> None:
         log.info("could not answer the reaction at all: %s", err)
 
 
+@client.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     """"More like this" — tap the card, get a different strain with a close profile.
 
@@ -650,6 +658,21 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     flip. The card's own strain comes from CARD_STRAINS rather than from the
     message, so an uncached message costs nothing.
     """
+    # UNCONDITIONAL, and the first statement in the function on purpose.
+    #
+    # Every log line so far has sat behind at least one check, so silence has
+    # never distinguished "the gateway delivered nothing" from "it delivered
+    # something a check rejected". A reaction event reaching this process now
+    # always leaves a mark, whatever it is and whoever sent it.
+    #
+    # DEBUG level, so a busy channel does not flood the console: the panel
+    # shows it while LOG_REACTIONS=1 is set and it costs nothing otherwise.
+    log.debug(
+        "raw reaction add: emoji=%r codepoints=%s user=%s message_id=%s channel=%s",
+        str(payload.emoji), [hex(ord(c)) for c in str(payload.emoji)],
+        payload.user_id, payload.message_id, payload.channel_id,
+    )
+
     if not same_emoji(payload.emoji, MORE_EMOJI):
         # Logged ONLY when it lands on one of our own cards. A busy channel is
         # full of unrelated reactions and logging all of them would bury the
@@ -687,6 +710,22 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             await say_under_card(
                 channel, payload.message_id, "Something went wrong pulling that one up."
             )
+
+
+@client.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    """Does nothing but say it happened.
+
+    The bot has no behaviour on un-reacting. This exists so that "do reaction
+    events reach this process at all" is answerable without guessing: if a
+    REMOVE logs and an ADD never does, the gateway is delivering and something
+    upstream of the add handler is eating it. If neither logs, nothing is
+    being delivered and the fault is not in this file.
+    """
+    log.debug(
+        "raw reaction remove: emoji=%r user=%s message_id=%s",
+        str(payload.emoji), payload.user_id, payload.message_id,
+    )
 
 
 async def _handle_more_like_this(payload: discord.RawReactionActionEvent):
