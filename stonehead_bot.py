@@ -63,6 +63,12 @@ REPLY_SOFT_MAX = 1400          # keep it readable in a busy channel
 # Client-side timeout. The endpoint itself is bounded by Netlify's 10s.
 REQUEST_TIMEOUT = 12
 
+# Bumped by hand whenever the bot changes. Logged on connect, because
+# "restart" on a Pterodactyl panel reboots the process with whatever files are
+# already on disk — it does not pull. Without this there is no way to tell a
+# deployed fix from an undeployed one except by guessing at behaviour.
+BUILD = "2026-09-21-reaction-diagnostics"
+
 GREEN = 0x4A7C4E
 
 # The "more like this" button. Deliberately not cannabis-themed: a leaf on a
@@ -634,6 +640,26 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if client.user is not None and payload.user_id == client.user.id:
         return
 
+    try:
+        await _handle_more_like_this(payload)
+    except Exception:
+        # discord.py catches what escapes an event handler and logs it to its
+        # own logger, which is a place nobody is looking when the symptom is
+        # "the button does nothing". An unexpected exception is the one
+        # failure mode every guard below cannot describe, so it gets a
+        # traceback and, where possible, a line in the channel.
+        log.exception(
+            "more-like-this blew up: message_id=%s user=%s", payload.message_id, payload.user_id
+        )
+        channel = client.get_channel(payload.channel_id)
+        if channel is not None and channel_ok(channel):
+            await say_under_card(
+                channel, payload.message_id, "Something went wrong pulling that one up."
+            )
+
+
+async def _handle_more_like_this(payload: discord.RawReactionActionEvent):
+
     # EVERY PATH THROUGH THIS HANDLER LEAVES A LINE, starting here.
     #
     # A tap that produced nothing was reported and could not be reproduced,
@@ -794,7 +820,11 @@ async def on_ready():
     if not commands_synced:
         await tree.sync()
         commands_synced = True
-    log.info("connected as %s — in %d servers", client.user, len(client.guilds))
+    log.info(
+        "connected as %s — in %d servers — build %s — intents(reactions=%s, guilds=%s)",
+        client.user, len(client.guilds), BUILD,
+        intents.reactions, intents.guilds,
+    )
 
 
 def main():

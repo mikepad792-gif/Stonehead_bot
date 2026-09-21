@@ -594,6 +594,37 @@ run(B.on_raw_reaction_add(FakePayload(own.id, user_id=555)))
 check("P09d the bot's own reaction does not answer itself",
       own.replies == [] and len(session.requests) == before)
 
+# ── P10: an unexpected exception is never swallowed ─────────────────
+#
+# discord.py catches whatever escapes an event handler and logs it to its own
+# logger, which is nowhere anybody looks when the symptom is "the button does
+# nothing". An unexpected exception is the one failure the guards cannot
+# describe, so it gets a traceback and a line in the channel.
+print("\nP10  nothing is swallowed")
+
+B.client = FakeClient(react_channel)
+boom = FakeMessage()
+react_channel.messages[boom.id] = boom
+B.CARD_STRAINS[boom.id] = "Blue-Dream"
+
+real_ask = B.ask_similar
+
+
+async def exploding(*a, **kw):
+    raise RuntimeError("something nobody predicted")
+
+
+B.ask_similar = exploding
+run(B.on_raw_reaction_add(FakePayload(boom.id)))
+B.ask_similar = real_ask
+
+check("P10a an unexpected error still answers in the channel", len(boom.replies) == 1, boom.replies)
+check("P10b ...and does not propagate out of the handler", True)
+
+# A build marker exists, so "is the fix deployed" is answerable from the boot
+# log instead of inferred from behaviour.
+check("P10c the build marker is set", bool(getattr(B, "BUILD", "")), getattr(B, "BUILD", None))
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)}")
