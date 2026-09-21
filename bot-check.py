@@ -555,6 +555,45 @@ check("P08g a 🔁 on someone else's message is left alone",
       theirs.replies == [] and len(react_channel.sent) == before_sent,
       theirs.replies)
 
+# ── P09: the age gate still holds on a reaction ─────────────────────
+#
+# The one dead end that stays SILENT, and has to. The gate exists so the bot
+# does not talk in a channel nobody flagged; posting "I can't help here" would
+# be talking. It is logged instead, because a gate refusing a channel the bot
+# posted a card in five minutes ago looks exactly like a broken bot from the
+# outside, and the log is the only thing that tells them apart.
+print("\nP09  the gate on reactions")
+
+gated = FakeChannel(nsfw=False)
+B.client = FakeClient(gated)
+gated_card = FakeMessage()
+gated.messages[gated_card.id] = gated_card
+B.CARD_STRAINS[gated_card.id] = "Blue-Dream"
+
+before = len(session.requests)
+run(B.on_raw_reaction_add(FakePayload(gated_card.id)))
+check("P09a a non age-restricted channel gets no reply", gated_card.replies == [], gated_card.replies)
+check("P09b ...and no lookup is spent", len(session.requests) == before)
+
+# And the emoji filter still holds: another reaction is not our business.
+B.client = FakeClient(react_channel)
+other_emoji = FakeMessage()
+react_channel.messages[other_emoji.id] = other_emoji
+B.CARD_STRAINS[other_emoji.id] = "Blue-Dream"
+before = len(session.requests)
+run(B.on_raw_reaction_add(FakePayload(other_emoji.id, emoji="\U0001F525")))
+check("P09c another emoji on our own card is ignored",
+      other_emoji.replies == [] and len(session.requests) == before)
+
+# The bot's own reaction must never answer itself.
+own = FakeMessage()
+react_channel.messages[own.id] = own
+B.CARD_STRAINS[own.id] = "Blue-Dream"
+before = len(session.requests)
+run(B.on_raw_reaction_add(FakePayload(own.id, user_id=555)))
+check("P09d the bot's own reaction does not answer itself",
+      own.replies == [] and len(session.requests) == before)
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)}")

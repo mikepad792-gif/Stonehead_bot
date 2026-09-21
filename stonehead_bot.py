@@ -633,6 +633,21 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # an event. Without this the card answers itself the moment it is posted.
     if client.user is not None and payload.user_id == client.user.id:
         return
+
+    # EVERY PATH THROUGH THIS HANDLER LEAVES A LINE, starting here.
+    #
+    # A tap that produced nothing was reported and could not be reproduced,
+    # and the reason it could not be narrowed down is that silence from this
+    # function was indistinguishable from the gateway never delivering the
+    # event at all. With this line, the absence of a log is itself the
+    # diagnosis: no line means the event never arrived (intents, gateway,
+    # a restart), and a line followed by one of the guards below names
+    # exactly which guard stopped it.
+    log.info(
+        "more-like-this tapped: message_id=%s user=%s channel=%s guild=%s known_card=%s",
+        payload.message_id, payload.user_id, payload.channel_id, payload.guild_id,
+        payload.message_id in CARD_STRAINS,
+    )
     # WHAT THIS RESOLVES IS THE STRAIN ON THE CARD, never the query that
     # produced it. They differ on three tiers out of five: a corrected card
     # shows Zkittlez for a typed "skittlez", a no-match card shows a strain
@@ -645,11 +660,27 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if channel is None:
         try:
             channel = await client.fetch_channel(payload.channel_id)
-        except discord.HTTPException:
+        except discord.HTTPException as err:
+            log.info(
+                "more-like-this could not resolve channel=%s: %s", payload.channel_id, err
+            )
             return
     if not channel_ok(channel):
         # The card was posted in an age-restricted channel and the flag has
-        # since come off. The gate has to hold now, not only at post time.
+        # since come off. The gate has to hold now, not only at post time,
+        # and this stays SILENT on purpose: the whole point of the gate is
+        # that the bot does not talk in a channel that has not been flagged.
+        #
+        # Logged, though. A gate that refuses a channel the bot posted a card
+        # in five minutes ago looks identical, from the outside, to the bot
+        # being broken — so the log is the only thing that can tell them
+        # apart. channel_ok falls through to False for any channel type
+        # without is_nsfw(), which is deliberate and is also the most likely
+        # way this refuses something it should not.
+        log.info(
+            "more-like-this refused by the age gate: channel=%s type=%s",
+            payload.channel_id, type(channel).__name__,
+        )
         return
 
     if not source:
