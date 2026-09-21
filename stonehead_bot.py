@@ -595,6 +595,26 @@ async def strain(interaction: discord.Interaction, name: str):
 # ---------------------------------------------------------------- reaction
 
 @client.event
+async def say_under_card(channel, message_id: int, text: str) -> None:
+    """Answer a reaction in the channel, under the card it was tapped on.
+
+    EVERY dead end in the reaction path comes through here. A tap that does
+    nothing is indistinguishable from a bot that has fallen over, and the
+    person who taps four times and gives up is the one telling us the silence
+    was the bug.
+    """
+    try:
+        original = await channel.fetch_message(message_id)
+        await original.reply(text, mention_author=False)
+        return
+    except discord.HTTPException:
+        pass
+    try:
+        await channel.send(text)
+    except discord.HTTPException as err:
+        log.info("could not answer the reaction at all: %s", err)
+
+
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     """"More like this" — tap the card, get a different strain with a close profile.
 
@@ -613,11 +633,13 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # an event. Without this the card answers itself the moment it is posted.
     if client.user is not None and payload.user_id == client.user.id:
         return
+    # WHAT THIS RESOLVES IS THE STRAIN ON THE CARD, never the query that
+    # produced it. They differ on three tiers out of five: a corrected card
+    # shows Zkittlez for a typed "skittlez", a no-match card shows a strain
+    # nobody named, and a picker card is the PICKER MESSAGE EDITED IN PLACE,
+    # so the id this arrives on was registered against the picked strain by
+    # offer_more when the button turned the list into a card.
     source = CARD_STRAINS.get(payload.message_id)
-    if not source:
-        # Not one of our cards, or one from before the last restart. In-memory
-        # by design — see CARD_STRAINS.
-        return
 
     channel = client.get_channel(payload.channel_id)
     if channel is None:
@@ -630,23 +652,68 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         # since come off. The gate has to hold now, not only at post time.
         return
 
+    if not source:
+        # Either one of our cards we have lost track of (CARD_STRAINS is in
+        # memory, so a restart empties it) or somebody else's message wearing
+        # the same emoji. Those need opposite treatment: the first is a
+        # failure worth saying out loud, the second is none of our business.
+        #
+        # One fetch tells them apart, and it only happens on this path.
+        try:
+            original = await channel.fetch_message(payload.message_id)
+        except discord.HTTPException:
+            return
+        if client.user is None or original.author.id != client.user.id:
+            return  # not our card; a tap on someone else's message is theirs
+        log.info(
+            "more-like-this could not resolve a strain: message_id=%s guild=%s user=%s",
+            payload.message_id, payload.guild_id, payload.user_id,
+        )
+        await say_under_card(
+            channel,
+            payload.message_id,
+            "Lost track of which strain that card was. Run /strain again and "
+            "I'll pick it back up.",
+        )
+        return
+
     try:
         result = await ask_similar(source, payload.user_id, payload.guild_id)
     except RateLimited:
-        # Silent on purpose. There is no ephemeral reply to a reaction, so the
-        # only way to say "slow down" is a public message in a channel where
-        # somebody is already tapping repeatedly — which is more noise than
-        # the thing it is complaining about. The tap simply does nothing.
+        # This used to stay silent, on the reasoning that a "slow down" line in
+        # a channel where somebody is already tapping is more noise than the
+        # tapping. That was wrong: silence and a dead bot look identical from
+        # the outside, and the person cannot tell which they are looking at.
         log.info("more-like-this rate limited guild=%s user=%s", payload.guild_id, payload.user_id)
+        await say_under_card(
+            channel, payload.message_id, "Easy. Give it a few minutes and tap again."
+        )
         return
     except (Unavailable, asyncio.TimeoutError, aiohttp.ClientError):
-        log.info("more-like-this unavailable guild=%s source=%r", payload.guild_id, source)
+        log.info(
+            "more-like-this unavailable guild=%s source=%r message_id=%s",
+            payload.guild_id, source, payload.message_id,
+        )
+        await say_under_card(
+            channel,
+            payload.message_id,
+            f"Couldn't pull up anything like {strain_title(source)} just now. Try again in a bit.",
+        )
         return
 
     if result is None:
-        # Nothing close enough in the table to be worth recommending. Saying
-        # nothing beats apologising for a button.
-        log.info("no similar strains for %r", source)
+        # Nothing close enough to recommend. 190 of the 2,351 records have no
+        # profile to score against — no description, or no effects or flavour
+        # list — so this is a reachable state and not a fault.
+        # Hawaiian-Thunder-Fuck is one of them AND it sits in a picker row,
+        # which is exactly how somebody finds this by accident.
+        log.info("no similar strains for %r (message_id=%s)", source, payload.message_id)
+        await say_under_card(
+            channel,
+            payload.message_id,
+            f"Nothing in the book close enough to {strain_title(source)} to be worth "
+            f"pointing you at.",
+        )
         return
 
     reply, rec, strain_data = result
