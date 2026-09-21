@@ -63,12 +63,35 @@ REPLY_SOFT_MAX = 1400          # keep it readable in a busy channel
 # Client-side timeout. The endpoint itself is bounded by Netlify's 10s.
 REQUEST_TIMEOUT = 12
 
+# Bumped by hand whenever the bot changes. Logged on connect, because
+# "restart" on a Pterodactyl panel reboots the process with whatever files are
+# already on disk — it does not pull. Without this there is no way to tell a
+# deployed fix from an undeployed one except by guessing at behaviour.
+BUILD = "2026-09-21-emoji-normalise"
+
 GREEN = 0x4A7C4E
 
 # The "more like this" button. Deliberately not cannabis-themed: a leaf on a
 # strain card reads as decoration and nobody taps decoration. A repeat arrow
 # reads as "again", which is the whole offer.
 MORE_EMOJI = "\U0001F501"  # 🔁
+
+
+def same_emoji(a, b) -> bool:
+    """Compare two emoji the way a person would, not the way bytes do.
+
+    Discord does not guarantee which form a client sends. The bot adds this
+    reaction programmatically, so its own copy is the bare code point; a
+    client tapping the SAME reaction can report it with a trailing variation
+    selector (U+FE0F), and occasionally with a zero-width joiner in the mix.
+    A plain != then rejects the exact button the bot just drew.
+
+    That failure is invisible: it happens before every log line and every
+    guard, so the tap produces no reply, no error and no trace. Stripping the
+    presentation characters is the whole fix.
+    """
+    strip = lambda e: "".join(c for c in str(e or "") if c not in "\uFE0F\uFE0E\u200D")
+    return strip(a) == strip(b)
 
 # Which strain each card the bot posted was about, so a tap can ask for
 # something like it. In memory ON PURPOSE: it is a UI affordance, not a
@@ -627,12 +650,46 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     flip. The card's own strain comes from CARD_STRAINS rather than from the
     message, so an uncached message costs nothing.
     """
-    if str(payload.emoji) != MORE_EMOJI:
+    if not same_emoji(payload.emoji, MORE_EMOJI):
+        # Logged ONLY when it lands on one of our own cards. A busy channel is
+        # full of unrelated reactions and logging all of them would bury the
+        # signal; a non-matching emoji on a card we posted is the one case
+        # where the comparison itself is the suspect.
+        if payload.message_id in CARD_STRAINS:
+            log.info(
+                "reaction on one of our cards but it did not match the button: "
+                "got %r (codepoints %s), want %r (codepoints %s), message_id=%s",
+                str(payload.emoji),
+                [hex(ord(c)) for c in str(payload.emoji)],
+                MORE_EMOJI,
+                [hex(ord(c)) for c in MORE_EMOJI],
+                payload.message_id,
+            )
         return
     # The bot adds this reaction itself, and that add comes straight back as
     # an event. Without this the card answers itself the moment it is posted.
     if client.user is not None and payload.user_id == client.user.id:
         return
+
+    try:
+        await _handle_more_like_this(payload)
+    except Exception:
+        # discord.py catches what escapes an event handler and logs it to its
+        # own logger, which is a place nobody is looking when the symptom is
+        # "the button does nothing". An unexpected exception is the one
+        # failure mode every guard below cannot describe, so it gets a
+        # traceback and, where possible, a line in the channel.
+        log.exception(
+            "more-like-this blew up: message_id=%s user=%s", payload.message_id, payload.user_id
+        )
+        channel = client.get_channel(payload.channel_id)
+        if channel is not None and channel_ok(channel):
+            await say_under_card(
+                channel, payload.message_id, "Something went wrong pulling that one up."
+            )
+
+
+async def _handle_more_like_this(payload: discord.RawReactionActionEvent):
 
     # EVERY PATH THROUGH THIS HANDLER LEAVES A LINE, starting here.
     #
@@ -794,7 +851,11 @@ async def on_ready():
     if not commands_synced:
         await tree.sync()
         commands_synced = True
-    log.info("connected as %s — in %d servers", client.user, len(client.guilds))
+    log.info(
+        "connected as %s — in %d servers — build %s — intents(reactions=%s, guilds=%s)",
+        client.user, len(client.guilds), BUILD,
+        intents.reactions, intents.guilds,
+    )
 
 
 def main():
