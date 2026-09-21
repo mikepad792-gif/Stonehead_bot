@@ -625,6 +625,38 @@ check("P10b ...and does not propagate out of the handler", True)
 # log instead of inferred from behaviour.
 check("P10c the build marker is set", bool(getattr(B, "BUILD", "")), getattr(B, "BUILD", None))
 
+# ── P11: the emoji comparison is the one silent path ────────────────
+#
+# THE BLIND SPOT. This check sits before every log line and every guard, so a
+# mismatch produces no reply, no error and no trace — the exact symptom
+# reported. Discord does not guarantee which form a client sends: the bot's
+# own reaction is the bare code point, and a client tapping THE SAME reaction
+# can report it with a trailing variation selector.
+print("\nP11  emoji forms")
+
+check("P11a the bare code point matches", B.same_emoji("\U0001F501", B.MORE_EMOJI))
+check("P11b U+FE0F (emoji presentation) matches",
+      B.same_emoji("\U0001F501\uFE0F", B.MORE_EMOJI))
+check("P11c U+FE0E (text presentation) matches",
+      B.same_emoji("\U0001F501\uFE0E", B.MORE_EMOJI))
+check("P11d a different emoji is still rejected",
+      not B.same_emoji("\U0001F525", B.MORE_EMOJI))
+check("P11e empty is rejected", not B.same_emoji("", B.MORE_EMOJI))
+check("P11f None is rejected without blowing up", not B.same_emoji(None, B.MORE_EMOJI))
+
+# End to end: a tap reported with the variation selector must be answered.
+B.client = FakeClient(react_channel)
+vs_card = FakeMessage()
+react_channel.messages[vs_card.id] = vs_card
+B.CARD_STRAINS[vs_card.id] = "Blue-Dream"
+
+session.status, session.payload = 200, SIMILAR
+before = len(session.requests)
+run(B.on_raw_reaction_add(FakePayload(vs_card.id, emoji="\U0001F501\uFE0F")))
+check("P11g a variation-selector tap produces a recommendation",
+      len(session.requests) - before == 1 and len(vs_card.replies) == 1,
+      (len(session.requests) - before, vs_card.replies))
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)}")
