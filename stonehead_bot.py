@@ -343,6 +343,17 @@ class Unavailable(Exception):
 # as broken rather than as over.
 PICKER_TIMEOUT = 600  # 10 minutes
 
+# Picker messages with a lookup already running against them.
+#
+# Disabling the buttons stops almost every repeat tap, but the disable only
+# takes effect once Discord renders the edit, and a double tap lands inside
+# that window. Without this, one impatient person becomes four endpoint calls
+# and four of their ten hourly lookups.
+#
+# Keyed by message id rather than by user: the picker belongs to a message,
+# and that is the thing being edited.
+PICKS_IN_FLIGHT: set[int] = set()
+
 
 class StrainPicker(discord.ui.View):
     """One row of buttons, one per strain in the family the query could mean.
@@ -393,10 +404,13 @@ class StrainPickButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         view: StrainPicker = self.view
+        message = interaction.message or view.message
+        picked_name = strain_title(self.strain)
 
         # Requester only. In a busy channel the list belongs to whoever asked,
         # and anyone else tapping it would spend THEIR hourly budget answering
-        # somebody else's question.
+        # somebody else's question. Checked before anything else, so a
+        # stranger is told rather than silently swallowed by the guard below.
         if interaction.user.id != view.requester_id:
             await interaction.response.send_message(
                 "That one's for someone else. Run /strain and I'll sort you out.",
@@ -404,22 +418,61 @@ class StrainPickButton(discord.ui.Button):
             )
             return
 
-        # Defer against the 3-second window before the lookup starts.
-        await interaction.response.defer()
+        # A lookup is already running against this message. Acknowledge so
+        # Discord does not show "interaction failed", and do nothing else —
+        # the loading line already on screen is the honest answer to "did that
+        # register?". No await between the check and the add, so nothing can
+        # interleave.
+        key = message.id if message is not None else None
+        if key is not None and key in PICKS_IN_FLIGHT:
+            log.info("ignoring a repeat tap while %s is still loading", self.strain)
+            await interaction.response.defer()
+            return
+        if key is not None:
+            PICKS_IN_FLIGHT.add(key)
 
+        # Held for the WHOLE operation, not just the lookup: the guard is about
+        # what is on screen, and the message is only settled once it has become
+        # the card or gone back to being a picker.
         try:
+            await self._pick(interaction, view, message, picked_name)
+        finally:
+            if key is not None:
+                PICKS_IN_FLIGHT.discard(key)
+
+    async def _pick(self, interaction, view, message, picked_name: str):
+        try:
+            # ACKNOWLEDGE BY UPDATING THE MESSAGE, not by deferring.
+            #
+            # A silent defer satisfies the 3-second window and shows the person
+            # nothing, so a 15-second lookup reads as a dead button — one
+            # tester tapped four times. This spends the same acknowledgement on
+            # feedback: the row locks, their choice goes green, and the text
+            # says what is being pulled up. One action, both jobs.
+            for item in view.children:
+                item.disabled = True
+            self.style = discord.ButtonStyle.success
+
+            await interaction.response.edit_message(
+                content=f"pulling up {picked_name}...",
+                embed=None,
+                view=view,
+            )
+
             answer = await ask_stonehead(
                 self.strain, interaction.user.id, interaction.guild_id
             )
         except RateLimited:
-            await interaction.followup.send(
-                "Easy. Give it a few minutes and ask again.", ephemeral=True
+            await self._recover(
+                interaction, view, message,
+                "Easy. Give it a few minutes and ask again.",
             )
             return
         except (Unavailable, asyncio.TimeoutError, aiohttp.ClientError):
-            await interaction.followup.send(
-                f"He's not answering right now. Try again in a bit, or come find him at {SITE_URL}",
-                ephemeral=True,
+            await self._recover(
+                interaction, view, message,
+                f"Couldn't pull {picked_name} up just now. Try again in a bit, "
+                f"or come find him at {SITE_URL}",
             )
             return
 
@@ -428,15 +481,14 @@ class StrainPickButton(discord.ui.Button):
             answer["reply"],
             answered,
             answer["strain_data"],
-            fallback_title=strain_title(self.strain),
+            fallback_title=picked_name,
         )
 
-        # EDIT the list into the card rather than posting under it. The list
-        # existed to ask a question that has now been answered, and leaving it
-        # above the card invites a second tap on a question nobody is asking
-        # any more. Dropping the view takes the buttons with it.
+        # The list existed to ask a question that has now been answered, so it
+        # becomes the card. Leaving it above invites a tap on a question
+        # nobody is asking any more; dropping the view takes the buttons and
+        # the loading line with it.
         view.stop()
-        message = view.message
         try:
             if message is not None:
                 await message.edit(content=None, embed=embed, view=None)
@@ -454,6 +506,25 @@ class StrainPickButton(discord.ui.Button):
             "strain pick guild=%s user=%s query=%r picked=%s",
             interaction.guild_id, interaction.user.id, view.query, self.strain,
         )
+
+    async def _recover(self, interaction, view, message, reason: str):
+        """Put the buttons back so the pick can be retried.
+
+        The one thing this must never do is leave the message sitting on
+        "pulling up ..." forever. A loading line that never resolves is worse
+        than the silent defer it replaced: it claims something is happening.
+        """
+        for item in view.children:
+            item.disabled = False
+            item.style = discord.ButtonStyle.secondary
+
+        try:
+            if message is not None:
+                await message.edit(content=f"{reason}\n\nPick one and I'll try again.", view=view)
+            else:
+                await interaction.followup.send(reason, ephemeral=True)
+        except discord.HTTPException as err:
+            log.info("could not restore the picker after a failure: %s", err)
 
 
 # ---------------------------------------------------------------- command
