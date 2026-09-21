@@ -67,7 +67,7 @@ REQUEST_TIMEOUT = 12
 # "restart" on a Pterodactyl panel reboots the process with whatever files are
 # already on disk — it does not pull. Without this there is no way to tell a
 # deployed fix from an undeployed one except by guessing at behaviour.
-BUILD = "2026-09-21-reaction-trace"
+BUILD = "2026-09-21-register-handler"
 
 GREEN = 0x4A7C4E
 
@@ -625,7 +625,6 @@ async def strain(interaction: discord.Interaction, name: str):
 
 # ---------------------------------------------------------------- reaction
 
-@client.event
 async def say_under_card(channel, message_id: int, text: str) -> None:
     """Answer a reaction in the channel, under the card it was tapped on.
 
@@ -646,6 +645,7 @@ async def say_under_card(channel, message_id: int, text: str) -> None:
         log.info("could not answer the reaction at all: %s", err)
 
 
+@client.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     """"More like this" — tap the card, get a different strain with a close profile.
 
