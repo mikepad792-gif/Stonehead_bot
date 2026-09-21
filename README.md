@@ -7,6 +7,10 @@ One slash command, `/strain <name>`. It posts the name to
 embed. No memory, no vibe tab, no accounts — those live on the site, behind a
 login, which is the point.
 
+Type a family name without its prefix — `/strain thunder fuck og` — and it
+answers with a row of buttons naming the members it holds, rather than "never
+heard of that one". Picking one edits the list into that strain's card.
+
 Every card it posts carries a 🔁 reaction. Tapping it gets a different strain
 with a close profile. **The strain is chosen server-side from a precomputed
 table, never by the model** — a model asked for "something similar" reliably
@@ -145,6 +149,17 @@ Invite it with **Send Messages**, **Embed Links**, **Read Message History** and
 
 No privileged intents. The bot never reads message content; it sees slash
 commands and reactions, both of which Discord sends without one.
+
+## Tests
+
+```
+python3 bot-check.py
+```
+
+No Discord connection, no HTTP, no token — every boundary is faked, so the
+assertions are about the bot's own decisions. The load-bearing ones are the
+guards: a card titled with the wrong strain, a picker button a stranger can
+press, and a reaction the bot answers itself are all silent failures.
 
 ## Environment variables
 
