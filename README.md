@@ -9,7 +9,8 @@ login, which is the point.
 
 Type a family name without its prefix — `/strain thunder fuck og` — and it
 answers with a row of buttons naming the members it holds, rather than "never
-heard of that one". Picking one edits the list into that strain's card.
+heard of that one". Picking one locks the row, marks the choice, and edits the list into that
+strain's card once the lookup returns.
 
 Every card it posts carries a 🔁 reaction. Tapping it gets a different strain
 with a close profile. **The strain is chosen server-side from a precomputed

@@ -106,15 +106,26 @@ class FakeFollowup:
 
 
 class FakeInteractionResponse:
-    def __init__(self):
+    def __init__(self, message=None):
         self.messages = []
         self.deferred = False
+        self.edits = []
+        self._message = message
 
     async def send_message(self, content=None, ephemeral=False, **kw):
         self.messages.append({"content": content, "ephemeral": ephemeral})
 
     async def defer(self):
         self.deferred = True
+
+    async def edit_message(self, content="unset", embed="unset", view="unset", **kw):
+        """The update-message response: acknowledges AND edits in one action."""
+        self.edits.append({"content": content, "embed": embed, "view": view})
+        if self._message is not None:
+            if content != "unset":
+                self._message.content = content
+            if view != "unset":
+                self._message.view = view
 
 
 class FakeChannel:
@@ -126,11 +137,12 @@ class FakeChannel:
 
 
 class FakeInteraction:
-    def __init__(self, user_id=42):
+    def __init__(self, user_id=42, message=None):
         self.channel = FakeChannel()
         self.guild_id = 7
         self.user = type("U", (), {"id": user_id})()
-        self.response = FakeInteractionResponse()
+        self.message = message
+        self.response = FakeInteractionResponse(message)
         self.followup = FakeFollowup()
 
 
@@ -206,7 +218,7 @@ view.message = picker_message
 button = view.children[0]
 
 before = len(session.requests)
-stranger = FakeInteraction(user_id=99)
+stranger = FakeInteraction(user_id=99, message=picker_message)
 run(button.callback(stranger))
 
 check("P02a a stranger gets an answer", len(stranger.response.messages) == 1)
@@ -218,10 +230,20 @@ check("P02e the buttons stay live for the requester", not view.is_finished())
 # ── P03: the requester tapping edits the list into the card ─────────
 print("\nP03  the pick")
 session.payload = CARD
-requester = FakeInteraction(user_id=42)
+requester = FakeInteraction(user_id=42, message=picker_message)
 run(button.callback(requester))
 
-check("P03a the tap is deferred against the 3s component window", requester.response.deferred is True)
+ack = requester.response.edits[0] if requester.response.edits else {}
+check("P03a the tap is acknowledged by UPDATING the message, not a silent defer",
+      len(requester.response.edits) == 1 and requester.response.deferred is False)
+check("P03a2 the ack names what is being pulled up",
+      "Alaskan Thunder Fuck" in (ack.get("content") or ""), ack.get("content"))
+check("P03a3 the whole row locks on the first tap",
+      all(c.disabled for c in view.children))
+check("P03a4 the tapped button is marked so the choice is visibly registered",
+      button.style == discord.ButtonStyle.success, button.style)
+check("P03a5 the other buttons are not marked",
+      all(c.style != discord.ButtonStyle.success for c in view.children if c is not button))
 check("P03b the pick asks for the strain on the button", session.requests[-1]["query"] == "Alaskan-Thunder-Fuck", session.requests[-1])
 check("P03c it is an ordinary lookup, not a special mode", "mode" not in session.requests[-1])
 check("P03d the picker message is edited, not replaced", len(picker_message.edits) == 1 and requester.followup.sent == [])
@@ -232,6 +254,92 @@ check("P03g the card is titled with the picked strain", getattr(edit.get("embed"
 check("P03h the resulting card gets the more-like-this button", picker_message.reactions == [B.MORE_EMOJI], picker_message.reactions)
 check("P03i ...and is remembered under the strain it shows", B.CARD_STRAINS.get(picker_message.id) == "Alaskan-Thunder-Fuck")
 check("P03j the view is finished, so a second tap does nothing", view.is_finished())
+
+# ── P3B: a repeat tap while loading spends nothing ──────────────────
+#
+# THE REPORT: nothing visible happened for 15-20 seconds and a tester tapped
+# the same button four times. Disabling the row stops most of that, but the
+# disable only lands once Discord renders the edit, and a fast double tap
+# arrives inside that window.
+print("\nP3B  repeat taps")
+
+slow_picker = PICKER["candidates"]
+view2 = B.StrainPicker(slow_picker, requester_id=42, query="thunder fuck og")
+msg2 = FakeMessage()
+view2.message = msg2
+btn2 = view2.children[0]
+
+gate = asyncio.Event()
+real_ask = B.ask_stonehead
+
+async def slow_ask(strain, user_id, guild_id):
+    session.requests.append({"query": strain})
+    await gate.wait()
+    return dict(CARD)
+
+B.ask_stonehead = slow_ask
+
+async def double_tap():
+    first = FakeInteraction(user_id=42, message=msg2)
+    task = asyncio.ensure_future(btn2.callback(first))
+    await asyncio.sleep(0)   # let the first tap reach the in-flight guard
+    second = FakeInteraction(user_id=42, message=msg2)
+
+    # Bounded. A second tap that reaches the endpoint blocks on the same gate
+    # the first one is holding, which without the guard is a DEADLOCK rather
+    # than a failure — and a test that hangs teaches nobody anything.
+    blocked = False
+    try:
+        await asyncio.wait_for(btn2.callback(second), timeout=1.0)
+    except asyncio.TimeoutError:
+        blocked = True
+
+    gate.set()
+    await task
+    return first, second, blocked
+
+before = len(session.requests)
+first, second, blocked = run(double_tap())
+B.ask_stonehead = real_ask
+
+check("P3B0 the second tap returns immediately instead of entering the lookup", not blocked)
+
+check("P3Ba the first tap calls the endpoint once",
+      len(session.requests) - before == 1, len(session.requests) - before)
+check("P3Bb the second tap makes NO endpoint call",
+      len(session.requests) - before == 1)
+check("P3Bc the second tap is acknowledged so Discord shows no failure",
+      second.response.deferred is True)
+check("P3Bd ...and changes nothing on screen",
+      second.response.edits == [] and second.response.messages == [])
+check("P3Be the guard is released once the pick finishes",
+      msg2.id not in B.PICKS_IN_FLIGHT, B.PICKS_IN_FLIGHT)
+
+# ── P3C: a failure never leaves it stuck on the loading line ────────
+print("\nP3C  failure recovery")
+
+view3 = B.StrainPicker(PICKER["candidates"], requester_id=42, query="thunder fuck og")
+msg3 = FakeMessage()
+view3.message = msg3
+btn3 = view3.children[0]
+
+session.status, session.payload = 500, {"error": "boom"}
+failed = FakeInteraction(user_id=42, message=msg3)
+run(btn3.callback(failed))
+
+last_edit = msg3.edits[-1] if msg3.edits else {}
+check("P3Ca the message is edited off the loading line", len(msg3.edits) >= 1)
+check("P3Cb it says it could not pull that one up",
+      "Couldn" in (last_edit.get("content") or ""), last_edit.get("content"))
+check("P3Cc every button is live again so they can retry",
+      all(not c.disabled for c in view3.children))
+check("P3Cd the green mark is cleared",
+      all(c.style != discord.ButtonStyle.success for c in view3.children))
+check("P3Ce the guard is released after a failure",
+      msg3.id not in B.PICKS_IN_FLIGHT, B.PICKS_IN_FLIGHT)
+check("P3Cf the view stays live so the timeout can still expire it",
+      not view3.is_finished())
+session.status = 200
 
 # ── P04: the row greys out rather than dying live ───────────────────
 print("\nP04  timeout")
