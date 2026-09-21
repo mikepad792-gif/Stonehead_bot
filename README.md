@@ -169,6 +169,7 @@ press, and a reaction the bot answers itself are all silent failures.
 | `DISCORD_TOKEN` | **Required.** Bot token from the Discord developer portal. |
 | `STONEHEAD_BOT_SECRET` | **Required.** Must match `BOT_SHARED_SECRET` in the site's Netlify environment. |
 | `STONEHEAD_API` | Optional. Defaults to the production endpoint; override for a deploy preview or `netlify dev`. |
+| `LOG_REACTIONS` | Optional. `1` prints every raw reaction event the process receives, with code points. For debugging the 🔁 button; noisy in a busy channel. |
 | `REQUIRE_AGE_RESTRICTED` | Optional. Defaults to on. `0` disables the age gate — testing only. |
 
 That's the whole list. In particular there is **no model setting here** — see

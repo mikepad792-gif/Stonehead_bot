@@ -657,6 +657,57 @@ check("P11g a variation-selector tap produces a recommendation",
       len(session.requests) - before == 1 and len(vs_card.replies) == 1,
       (len(session.requests) - before, vs_card.replies))
 
+# ── P12: a reaction event always leaves a mark ──────────────────────
+#
+# Every log line before this sat behind at least one check, so silence never
+# distinguished "the gateway delivered nothing" from "it delivered something a
+# check rejected". That ambiguity has cost four rounds of narrowing.
+print("\nP12  nothing arrives unseen")
+
+import logging  # noqa: E402
+
+class Capture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+cap = Capture()
+B.log.addHandler(cap)
+old_level = B.log.level
+B.log.setLevel(logging.DEBUG)
+
+traced = FakeMessage()
+react_channel.messages[traced.id] = traced
+B.client = FakeClient(react_channel)
+
+# An emoji that is not the button, on a message we have never registered.
+# Before this, that combination was completely silent.
+B.CARD_STRAINS.pop(traced.id, None)
+cap.lines.clear()
+run(B.on_raw_reaction_add(FakePayload(traced.id, emoji="\U0001F525")))
+check("P12a an unmatched emoji on an unknown message still traces",
+      any("raw reaction add" in line for line in cap.lines), cap.lines)
+check("P12b ...with the code points, so the comparison is checkable",
+      any("0x1f525" in line for line in cap.lines), cap.lines)
+
+# And a removal traces too, which is what separates "no events at all" from
+# "adds specifically are being eaten".
+cap.lines.clear()
+run(B.on_raw_reaction_remove(FakePayload(traced.id)))
+check("P12c a reaction REMOVE traces as well",
+      any("raw reaction remove" in line for line in cap.lines), cap.lines)
+
+B.log.setLevel(old_level)
+B.log.removeHandler(cap)
+
+# The trace must be off unless asked for, or a busy channel buries everything.
+check("P12d the trace is debug level, so it is silent by default",
+      B.log.level in (0, logging.INFO), B.log.level)
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)}")
