@@ -76,12 +76,21 @@ class FakeMessage:
         self.id = FakeMessage._next_id
         self.reactions = []
         self.edits = []
+        self.replies = []
         self.embed = None
         self.content = None
         self.view = "unset"
+        # Who Discord says posted it. The reaction handler fetches this to
+        # tell one of our own cards from somebody else's message.
+        self.author = type("A", (), {"id": 555})()
 
     async def add_reaction(self, emoji):
         self.reactions.append(emoji)
+
+    async def reply(self, content=None, embed=None, mention_author=None):
+        child = FakeMessage()
+        self.replies.append({"content": content, "embed": embed, "message": child})
+        return child
 
     async def edit(self, content="unset", embed=None, view="unset"):
         self.edits.append({"content": content, "embed": embed, "view": view})
@@ -131,9 +140,21 @@ class FakeInteractionResponse:
 class FakeChannel:
     def __init__(self, nsfw=True):
         self._nsfw = nsfw
+        self.messages = {}
+        self.sent = []
 
     def is_nsfw(self):
         return self._nsfw
+
+    async def fetch_message(self, message_id):
+        if message_id not in self.messages:
+            raise discord.HTTPException(type("R", (), {"status": 404})(), "not found")
+        return self.messages[message_id]
+
+    async def send(self, content=None, embed=None):
+        message = FakeMessage()
+        self.sent.append({"content": content, "embed": embed})
+        return message
 
 
 class FakeInteraction:
@@ -158,6 +179,17 @@ class FakeClient:
 
     def get_channel(self, _id):
         return self._channel
+
+
+class FakePayload:
+    """A raw reaction event."""
+
+    def __init__(self, message_id, user_id=42, emoji=None, channel_id=5, guild_id=7):
+        self.message_id = message_id
+        self.user_id = user_id
+        self.emoji = emoji if emoji is not None else B.MORE_EMOJI
+        self.channel_id = channel_id
+        self.guild_id = guild_id
 
 
 CARD = {
@@ -366,6 +398,201 @@ blocked.channel = FakeChannel(nsfw=False)
 run(command(blocked, "thunder fuck og"))
 check("P06a a non age-restricted channel is refused", len(blocked.response.messages) == 1)
 check("P06b ...before any request is made", len(session.requests) == before)
+
+# ── P07: the reaction resolves the strain ON THE CARD ───────────────
+#
+# THE REPORT: 🔁 did nothing on a card produced by the button picker. That
+# card is the picker MESSAGE EDITED IN PLACE, so the id the reaction arrives
+# on is the picker's — and if anything resolved the strain from the query that
+# produced the picker ("thunder fuck og"), it would ask the endpoint for a
+# family name that is not a key in the table and get nothing back.
+#
+# Every tier is checked, because the same question applies to each: what the
+# reaction must resolve is the strain the person is LOOKING AT, never the one
+# they typed.
+print("\nP07  the reaction resolves what is on the card")
+
+react_channel = FakeChannel()
+B.client = FakeClient(react_channel)
+
+SIMILAR = {
+    "reply": "Try Romulan.",
+    "matched": True,
+    "strain": "Romulan",
+    "source_strain": "x",
+    "tier": "similar",
+    "strain_data": {"type": "indica", "rating": 4, "effects": ["Relaxed"], "flavor": ["Earthy"]},
+}
+
+
+def card_from_lookup(payload, typed):
+    """Run /strain and hand back the message the card landed on."""
+    session.payload = payload
+    interaction = FakeInteraction()
+    run(command(interaction, typed))
+    sent = interaction.followup.sent[-1]
+    # The command's fake followup makes a message; mirror it into the channel
+    # so the reaction handler can fetch it.
+    message = FakeMessage()
+    message.embed = sent["embed"]
+    react_channel.messages[message.id] = message
+    run(B.offer_more(message, payload["strain"]))
+    return message
+
+
+def tap_more(message):
+    session.payload = SIMILAR
+    before = len(session.requests)
+    run(B.on_raw_reaction_add(FakePayload(message.id)))
+    return session.requests[-1] if len(session.requests) > before else None
+
+
+# --- picker-produced card: the picked strain, not the family query ---
+session.payload = PICKER
+picker_interaction = FakeInteraction()
+run(command(picker_interaction, "thunder fuck og"))
+pview = picker_interaction.followup.sent[0]["view"]
+pmsg = FakeMessage()
+react_channel.messages[pmsg.id] = pmsg
+pview.message = pmsg
+
+session.payload = {
+    "reply": "Alaskan Thunder Fuck, yeah.", "matched": True,
+    "strain": "Alaskan-Thunder-Fuck", "tier": "exact",
+    "strain_data": {"type": "sativa", "rating": 4.2, "effects": ["Euphoric"], "flavor": ["Pine"]},
+}
+run(pview.children[0].callback(FakeInteraction(user_id=42, message=pmsg)))
+
+sent = tap_more(pmsg)
+check("P07a 🔁 on a picker card asks about the PICKED strain",
+      sent and sent.get("source_strain") == "Alaskan-Thunder-Fuck", sent)
+check("P07b ...not the family query that produced the picker",
+      not sent or sent.get("source_strain") != "thunder fuck og")
+
+# --- tier B corrected: the corrected strain, not the typed spelling ---
+corrected = card_from_lookup({
+    "reply": "Not under that spelling. Zkittlez though.", "matched": False,
+    "strain": "Zkittlez", "tier": "candidate",
+    "strain_data": {"type": "hybrid", "rating": 4.3, "effects": ["Happy"], "flavor": ["Sweet"]},
+}, "skittlez")
+sent = tap_more(corrected)
+check("P07c 🔁 on a corrected card asks about the corrected strain",
+      sent and sent.get("source_strain") == "Zkittlez", sent)
+check("P07d ...not the typed spelling", not sent or sent.get("source_strain") != "skittlez")
+
+# --- tier C random: the strain shown, not the unknown query ---
+unrelated = card_from_lookup({
+    "reply": "Never heard of fhqwhgads. Here's Gg 5 though, different strain.",
+    "matched": False, "strain": "Gg-5", "tier": "unrelated",
+    "strain_data": {"type": "hybrid", "rating": 4, "effects": ["Relaxed"], "flavor": ["Pine"]},
+}, "fhqwhgads")
+sent = tap_more(unrelated)
+check("P07e 🔁 on a no-match card asks about the strain SHOWN",
+      sent and sent.get("source_strain") == "Gg-5", sent)
+check("P07f ...not the query nobody could resolve",
+      not sent or sent.get("source_strain") != "fhqwhgads")
+
+# ── P08: a reaction never dies quietly ──────────────────────────────
+#
+# A tap that does nothing is indistinguishable from a bot that has fallen
+# over. 190 of the 2,351 records have no profile to score against, so "no
+# candidates" is a reachable state and not a fault — Hawaiian-Thunder-Fuck is
+# one of them and it sits in a picker row.
+print("\nP08  no silent dead ends")
+
+# --- nothing to recommend (the endpoint 404s) ---
+target = card_from_lookup({
+    "reply": "Hawaiian Thunder Fuck.", "matched": True,
+    "strain": "Hawaiian-Thunder-Fuck", "tier": "exact",
+    "strain_data": {"type": "sativa", "rating": 4, "effects": ["Happy"], "flavor": ["Pine"]},
+}, "hawaiian thunder fuck")
+session.status, session.payload = 404, {"error": "No similar strains"}
+run(B.on_raw_reaction_add(FakePayload(target.id)))
+check("P08a a 404 posts a visible reply instead of nothing",
+      len(target.replies) == 1, target.replies)
+check("P08b ...naming the strain it could not match",
+      "Hawaiian Thunder Fuck" in (target.replies[0]["content"] or "") if target.replies else False,
+      target.replies[0]["content"] if target.replies else None)
+session.status = 200
+
+# --- rate limited ---
+target2 = card_from_lookup({
+    "reply": "Blue Dream.", "matched": True, "strain": "Blue-Dream", "tier": "exact",
+    "strain_data": {"type": "hybrid", "rating": 4.3, "effects": ["Happy"], "flavor": ["Berry"]},
+}, "blue dream")
+session.status = 429
+run(B.on_raw_reaction_add(FakePayload(target2.id)))
+check("P08c a rate limit says so instead of going quiet", len(target2.replies) == 1, target2.replies)
+session.status = 200
+
+# --- endpoint down ---
+target3 = card_from_lookup({
+    "reply": "Blue Dream.", "matched": True, "strain": "Blue-Dream", "tier": "exact",
+    "strain_data": {"type": "hybrid", "rating": 4.3, "effects": ["Happy"], "flavor": ["Berry"]},
+}, "blue dream")
+session.status = 500
+run(B.on_raw_reaction_add(FakePayload(target3.id)))
+check("P08d an outage says so instead of going quiet", len(target3.replies) == 1, target3.replies)
+session.status = 200
+
+# --- our card, strain forgotten (a restart empties CARD_STRAINS) ---
+orphan = FakeMessage()
+react_channel.messages[orphan.id] = orphan
+B.CARD_STRAINS.pop(orphan.id, None)
+before = len(session.requests)
+run(B.on_raw_reaction_add(FakePayload(orphan.id)))
+check("P08e an unresolvable card of OURS gets a visible reply",
+      len(orphan.replies) == 1, orphan.replies)
+check("P08f ...and spends no lookup doing it", len(session.requests) == before)
+
+# --- somebody else's message wearing the same emoji: stay out of it ---
+theirs = FakeMessage()
+theirs.author = type("A", (), {"id": 999})()
+react_channel.messages[theirs.id] = theirs
+before_sent = len(react_channel.sent)
+run(B.on_raw_reaction_add(FakePayload(theirs.id)))
+check("P08g a 🔁 on someone else's message is left alone",
+      theirs.replies == [] and len(react_channel.sent) == before_sent,
+      theirs.replies)
+
+# ── P09: the age gate still holds on a reaction ─────────────────────
+#
+# The one dead end that stays SILENT, and has to. The gate exists so the bot
+# does not talk in a channel nobody flagged; posting "I can't help here" would
+# be talking. It is logged instead, because a gate refusing a channel the bot
+# posted a card in five minutes ago looks exactly like a broken bot from the
+# outside, and the log is the only thing that tells them apart.
+print("\nP09  the gate on reactions")
+
+gated = FakeChannel(nsfw=False)
+B.client = FakeClient(gated)
+gated_card = FakeMessage()
+gated.messages[gated_card.id] = gated_card
+B.CARD_STRAINS[gated_card.id] = "Blue-Dream"
+
+before = len(session.requests)
+run(B.on_raw_reaction_add(FakePayload(gated_card.id)))
+check("P09a a non age-restricted channel gets no reply", gated_card.replies == [], gated_card.replies)
+check("P09b ...and no lookup is spent", len(session.requests) == before)
+
+# And the emoji filter still holds: another reaction is not our business.
+B.client = FakeClient(react_channel)
+other_emoji = FakeMessage()
+react_channel.messages[other_emoji.id] = other_emoji
+B.CARD_STRAINS[other_emoji.id] = "Blue-Dream"
+before = len(session.requests)
+run(B.on_raw_reaction_add(FakePayload(other_emoji.id, emoji="\U0001F525")))
+check("P09c another emoji on our own card is ignored",
+      other_emoji.replies == [] and len(session.requests) == before)
+
+# The bot's own reaction must never answer itself.
+own = FakeMessage()
+react_channel.messages[own.id] = own
+B.CARD_STRAINS[own.id] = "Blue-Dream"
+before = len(session.requests)
+run(B.on_raw_reaction_add(FakePayload(own.id, user_id=555)))
+check("P09d the bot's own reaction does not answer itself",
+      own.replies == [] and len(session.requests) == before)
 
 print()
 if FAILURES:
