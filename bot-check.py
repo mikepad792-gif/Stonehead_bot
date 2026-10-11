@@ -18,6 +18,8 @@ import os
 import sys
 
 os.environ.setdefault("STONEHEAD_BOT_SECRET", "test-secret")
+os.environ["OWNER_DISCORD_ID"] = "1520166782013542422"
+os.environ["GIVEAWAY_GUILD_IDS"] = "788166388250443846"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import discord  # noqa: E402
@@ -69,6 +71,7 @@ class FakeSession:
 
     def post(self, url, json=None, headers=None, timeout=None):
         self.requests.append(json)
+        self.urls = getattr(self, "urls", []) + [url]
         return FakeResponse(self.status, self.payload)
 
 
@@ -96,7 +99,7 @@ class FakeMessage:
         self.replies.append({"content": content, "embed": embed, "message": child})
         return child
 
-    async def edit(self, content="unset", embed=None, view="unset"):
+    async def edit(self, content="unset", embed=None, view="unset", **kw):
         self.edits.append({"content": content, "embed": embed, "view": view})
         if content != "unset":
             self.content = content
@@ -128,7 +131,7 @@ class FakeInteractionResponse:
     async def send_message(self, content=None, ephemeral=False, **kw):
         self.messages.append({"content": content, "ephemeral": ephemeral})
 
-    async def defer(self):
+    async def defer(self, **kw):
         self.deferred = True
 
     async def edit_message(self, content="unset", embed="unset", view="unset", **kw):
@@ -155,9 +158,11 @@ class FakeChannel:
             raise discord.HTTPException(type("R", (), {"status": 404})(), "not found")
         return self.messages[message_id]
 
-    async def send(self, content=None, embed=None):
+    async def send(self, content=None, embed=None, view=None, **kw):
         message = FakeMessage()
-        self.sent.append({"content": content, "embed": embed})
+        message.content = content
+        self.sent.append({"content": content, "embed": embed, "view": view, "message": message})
+        self.messages[message.id] = message
         return message
 
 
@@ -165,7 +170,7 @@ class FakeInteraction:
     def __init__(self, user_id=42, message=None):
         self.channel = FakeChannel()
         self.guild_id = 7
-        self.user = type("U", (), {"id": user_id})()
+        self.user = type("U", (), {"id": user_id, "display_name": "bob"})()
         self.message = message
         self.response = FakeInteractionResponse(message)
         self.followup = FakeFollowup()
@@ -750,6 +755,229 @@ check(
     stray == [],
     f"these were decorated but are not events: {stray}",
 )
+
+# ── Weekly Moai Drop ────────────────────────────────────────────────
+print("\nMoai Drop")
+
+OWNER = 1520166782013542422
+
+check("M1 API base is the lookup URL minus /strain-lookup", B.API_BASE == "https://stoneheadai.com/api", B.API_BASE)
+check("M1 owner and giveaway servers come from the environment",
+      B.OWNER_DISCORD_ID == OWNER and B.GIVEAWAY_GUILD_IDS == [788166388250443846])
+check("M2 /link and /entries are global; /giveaway is not",
+      sorted(c.name for c in B.tree.get_commands()) == ["entries", "link", "strain"],
+      [c.name for c in B.tree.get_commands()])
+check("M2 /giveaway exists only in the allowed server",
+      [c.name for c in B.tree.get_commands(guild=discord.Object(id=788166388250443846))] == ["giveaway"]
+      and B.tree.get_commands(guild=discord.Object(id=1)) == [])
+
+check("M3 host check is the user id only",
+      B.is_host(type("U", (), {"id": OWNER})()) and not B.is_host(type("U", (), {"id": OWNER + 1})()))
+saved_owner = B.OWNER_DISCORD_ID
+B.OWNER_DISCORD_ID = 0
+check("M3 no owner configured means nobody is the host", not B.is_host(type("U", (), {"id": 0})()))
+B.OWNER_DISCORD_ID = saved_owner
+
+group = B.tree.get_command("giveaway", guild=discord.Object(id=788166388250443846))
+stranger = FakeInteraction(user_id=999)
+allowed = run(group.interaction_check(stranger))
+check("M4 a non-host (server owner, admin, anyone) gets the refusal and nothing runs",
+      allowed is False and stranger.response.messages == [{"content": "This one's just for the host.", "ephemeral": True}],
+      stranger.response.messages)
+host = FakeInteraction(user_id=OWNER)
+check("M4 the host passes", run(group.interaction_check(host)) is True and host.response.messages == [])
+
+def fresh_session(status, payload):
+    fs = FakeSession()
+    fs.status, fs.payload = status, payload
+    B.session = fs
+    return fs
+
+# Enter while linked: private reply with the count and a Leave button.
+fs = fresh_session(200, {"status": "entered", "round_id": 7, "message": "You're in this week's Moai Drop. Entries so far: 4"})
+tap = FakeInteraction(user_id=42)
+run(B.handle_round_button(tap, "enter:7"))
+sent = tap.followup.sent[0] if tap.followup.sent else {}
+check("M5 Enter sends the tap to the site with who tapped",
+      fs.requests == [{"action": "enter", "round_id": 7, "discord_id": "42", "discord_username": "bob"}]
+      and fs.urls == ["https://stoneheadai.com/api/bot-round-enter"], fs.requests)
+check("M5 the reply is private and carries Leave this week",
+      sent.get("ephemeral") is True and sent.get("content", "").startswith("You're in")
+      and [i.custom_id for i in sent["view"].children] == ["leave:7"], sent)
+
+fs = fresh_session(200, {"status": "unlinked", "round_id": 7, "message": "Almost in.", "link_url": "https://stoneheadai.com/link-discord?t=abc"})
+tap = FakeInteraction()
+run(B.handle_round_button(tap, "enter:7"))
+button = tap.followup.sent[0]["view"].children[0]
+check("M6 Enter while unlinked: private reply with the link button",
+      tap.followup.sent[0]["ephemeral"] and button.url == "https://stoneheadai.com/link-discord?t=abc"
+      and button.label == "Link my StoneHead account")
+
+fs = fresh_session(200, {"status": "left", "message": "You're out for this week."})
+tap = FakeInteraction()
+run(B.handle_round_button(tap, "leave:7"))
+check("M7 Leave goes through as leave, private, no button",
+      fs.requests[0]["action"] == "leave" and tap.followup.sent[0]["view"] is None and tap.followup.sent[0]["ephemeral"])
+
+fs = fresh_session(200, {"status": "entered", "message": "x"})
+tap = FakeInteraction()
+tap.channel = FakeChannel(nsfw=False)
+run(B.handle_round_button(tap, "enter:7"))
+check("M8 a round button in a channel that isn't age-restricted is refused, site not called",
+      fs.requests == [] and tap.response.messages and tap.response.messages[0]["ephemeral"])
+
+fs = fresh_session(500, {})
+tap = FakeInteraction()
+run(B.handle_round_button(tap, "enter:7"))
+check("M9 site trouble still answers, privately", tap.followup.sent and tap.followup.sent[0]["ephemeral"])
+
+fs = fresh_session(200, {})
+tap = FakeInteraction()
+run(B.handle_round_button(tap, "enter:abc"))
+check("M9 a malformed custom_id is ignored", fs.requests == [] and tap.followup.sent == [])
+
+class FakeComponentInteraction(FakeInteraction):
+    def __init__(self, custom_id):
+        super().__init__()
+        self.type = discord.InteractionType.component
+        self.data = {"custom_id": custom_id}
+
+fs = fresh_session(200, {"status": "entered", "round_id": 7, "message": "in"})
+run(B.on_interaction(FakeComponentInteraction("pick:Blue-Dream")))
+check("M10 on_interaction leaves the strain picker's buttons alone", fs.requests == [])
+run(B.on_interaction(FakeComponentInteraction("enter:7")))
+check("M10 on_interaction routes 🗿 Enter", len(fs.requests) == 1)
+check("M10 on_interaction is registered on the client",
+      getattr(REAL_CLIENT, "on_interaction", None) is B.on_interaction)
+
+# /link
+fs = fresh_session(200, {"url": "https://stoneheadai.com/link-discord?t=xyz", "short_code": "482913"})
+inter = FakeInteraction(user_id=42)
+run(B.link.callback(inter))
+msg = inter.followup.sent[0]
+check("M11 /link: private, the 15-minute line, and a link button",
+      msg["ephemeral"] and msg["content"] == "Tap to link your StoneHead account. Link works for 15 minutes."
+      and msg["view"].children[0].url.endswith("t=xyz")
+      and fs.requests == [{"discord_id": "42", "discord_username": "bob"}])
+fs = fresh_session(500, {})
+inter = FakeInteraction()
+run(B.link.callback(inter))
+check("M11 /link failure says so", inter.followup.sent[0]["content"] == "Couldn't make a link right now. Try again in a minute.")
+
+# /entries
+fs = fresh_session(200, {"status": "not_entered", "message": "Tap 🗿 Enter on this week's post."})
+inter = FakeInteraction()
+run(B.entries.callback(inter))
+check("M12 /entries asks by server and shows the line privately",
+      fs.requests[0]["action"] == "status" and fs.requests[0]["guild_id"] == "7"
+      and inter.followup.sent[0] == {"content": "Tap 🗿 Enter on this week's post.", "embed": None, "view": None, "ephemeral": True},
+      inter.followup.sent)
+
+# The spin
+frames = B.spin_frames(["@everyone", "**bold**", "carl"])
+check("M13 spin: 8 frames, never faster than one edit per 0.8s, slowing down",
+      len(frames) == 8 and all(d >= 0.8 for _, d in frames)
+      and all(frames[i][1] <= frames[i + 1][1] for i in range(7)))
+check("M13 spin names can't ping or format", "@everyone" not in frames[0][0] and "**bold**" not in frames[1][0], frames[:2])
+result = B.result_text({"winner_discord_id": "300000000000000001", "prize": "30 day pass", "total_people": 3, "total_entries": 13})
+check("M14 the result names the winner and totals only",
+      result == "🗿 **<@300000000000000001>** wins this week's Moai Drop! 30 day pass. 3 people, 13 entries.", result)
+check("M15 no em dashes in anything the drop says",
+      not any(ch in t for t in [result, B.NOT_HOST] + [f for f, _ in frames] for ch in "–—"))
+
+total = sum(d for _, d in B.spin_frames(["a"])) + 0.9
+check("M13 the whole spin takes 6 to 8 seconds", 6 <= total <= 8, total)
+
+# Full host flows with the site faked per endpoint.
+calls = []
+def fake_api(responses):
+    async def call(path, payload):
+        calls.append((path, payload))
+        return responses[path]
+    return call
+real_call_api, real_sleep, real_get_channel = B.call_api, B.asyncio.sleep, B.client.get_channel
+
+async def no_sleep(_s):
+    return None
+
+calls.clear()
+B.call_api = fake_api({
+    "bot-round-create": (200, {"status": "ok", "round_id": 12, "post_text": "🗿 The Weekly Moai Drop 🗿"}),
+    "bot-round-message": (200, {"status": "ok"}),
+})
+host = FakeInteraction(user_id=OWNER)
+host.channel_id = 5
+run(group.get_command("start").callback(group, host, "30 day pass", 7, 30))
+post = host.channel.sent[0] if host.channel.sent else {}
+btn = post["view"].children[0] if post.get("view") else None
+check("M16 start posts the round with a 🗿 Enter button for that round",
+      post.get("content") == "🗿 The Weekly Moai Drop 🗿" and btn is not None
+      and btn.custom_id == "enter:12" and str(btn.emoji) == "🗿" and not btn.disabled, post)
+check("M16 start sends who ran it, and then the post id",
+      calls[0] == ("bot-round-create", {"invoker_discord_id": str(OWNER), "guild_id": "7", "channel_id": "5",
+                                        "prize": "30 day pass", "bonus_days": 7, "pass_days": 30})
+      and calls[1] == ("bot-round-message", {"invoker_discord_id": str(OWNER), "round_id": 12, "message_id": str(post["message"].id)}),
+      calls)
+check("M16 the host gets a private confirmation", host.followup.sent[-1]["ephemeral"])
+
+host = FakeInteraction(user_id=OWNER)
+host.channel = FakeChannel(nsfw=False)
+calls.clear()
+run(group.get_command("start").callback(group, host, "30 day pass", 0, 30))
+check("M17 start refuses a channel that isn't age-restricted", calls == [] and host.response.messages)
+
+# Draw: closes the post, spins in the round's channel, lands on the winner.
+round_channel = FakeChannel()
+round_post = FakeMessage()
+round_channel.messages[777] = round_post
+B.client.get_channel = lambda _id: round_channel
+B.asyncio.sleep = no_sleep
+calls.clear()
+B.call_api = fake_api({"bot-round-draw": (200, {
+    "status": "ok", "round_id": 12, "channel_id": "5", "message_id": "777",
+    "winner_discord_id": "300000000000000001", "winner_is_founder": True,
+    "prize": "30 day pass", "total_people": 3, "total_entries": 13, "spin_names": ["alice", "bob", "carl"],
+})})
+host = FakeInteraction(user_id=OWNER)
+run(group.get_command("draw").callback(group, host))
+closed = round_post.edits[-1]["view"].children[0] if round_post.edits else None
+spin_msg = round_channel.sent[0]["message"] if round_channel.sent else None
+check("M18 draw greys out the Enter button", closed is not None and closed.disabled and closed.label == "Entries closed")
+check("M18 the spin edits one message and lands on the winner",
+      spin_msg is not None and len(spin_msg.edits) == 9
+      and spin_msg.content == "🗿 **<@300000000000000001>** wins this week's Moai Drop! 30 day pass. 3 people, 13 entries.",
+      spin_msg.content if spin_msg else round_channel.sent)
+check("M18 a founder win is flagged to the host, privately",
+      "founder" in host.followup.sent[-1]["content"] and host.followup.sent[-1]["ephemeral"])
+
+round_channel = FakeChannel()
+B.client.get_channel = lambda _id: round_channel
+B.call_api = fake_api({"bot-round-draw": (200, {"status": "no_entries", "round_id": 12, "channel_id": "5", "message_id": None})})
+run(group.get_command("draw").callback(group, FakeInteraction(user_id=OWNER)))
+check("M19 no counted entries says so in the channel",
+      round_channel.sent and "No counted entries" in round_channel.sent[0]["content"])
+
+round_channel = FakeChannel()
+round_post = FakeMessage()
+round_channel.messages[777] = round_post
+B.client.get_channel = lambda _id: round_channel
+B.call_api = fake_api({"bot-round-cancel": (200, {"status": "ok", "round_id": 12, "channel_id": "5", "message_id": "777"})})
+host = FakeInteraction(user_id=OWNER)
+run(group.get_command("cancel").callback(group, host))
+check("M20 cancel greys out the button and tells the host",
+      round_post.edits and round_post.edits[-1]["view"].children[0].disabled and host.followup.sent[-1]["ephemeral"])
+
+# Nudge: posts the site's line, mentions nobody, skips a channel that lost its age flag.
+nudge_channel = FakeChannel()
+B.client.get_channel = lambda _id: nudge_channel
+B.call_api = fake_api({"bot-round-nudge": (200, {"nudges": [{"round_id": 12, "channel_id": "5", "message": "Tapped Enter but didn't finish linking?"}]})})
+run(B.nudge_once())
+check("M21 nudge posts the line once", [m["content"] for m in nudge_channel.sent] == ["Tapped Enter but didn't finish linking?"])
+nudge_channel = FakeChannel(nsfw=False)
+run(B.nudge_once())
+check("M21 nudge stays quiet in a channel that isn't age-restricted", nudge_channel.sent == [])
+
+B.call_api, B.asyncio.sleep, B.client.get_channel = real_call_api, real_sleep, real_get_channel
 
 print()
 if FAILURES:

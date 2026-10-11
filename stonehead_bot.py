@@ -56,6 +56,33 @@ API_URL = os.environ.get("STONEHEAD_API", "https://stoneheadai.com/api/strain-lo
 BOT_SECRET = os.environ.get("STONEHEAD_BOT_SECRET", "")
 SITE_URL = "https://stoneheadai.com"
 
+# The rest of the API (linking, the Moai Drop) lives next to the lookup.
+# STONEHEAD_API_URL overrides it; otherwise it's STONEHEAD_API minus
+# /strain-lookup, so a preview deploy set there is followed here too.
+API_BASE = (
+    os.environ.get("STONEHEAD_API_URL")
+    or API_URL.rsplit("/strain-lookup", 1)[0]
+).rstrip("/")
+
+
+def _int_or_zero(raw) -> int:
+    try:
+        return int(str(raw or "").strip())
+    except ValueError:
+        return 0
+
+
+# The Weekly Moai Drop host. ONLY this Discord user can run /giveaway, in any
+# server: roles, admin and server ownership are ignored. Unset means nobody.
+# The site checks the same id again on every giveaway call.
+OWNER_DISCORD_ID = _int_or_zero(os.environ.get("OWNER_DISCORD_ID"))
+
+# Servers where /giveaway exists at all. It is registered as a guild command
+# in these only, never globally, so no other server ever sees it.
+GIVEAWAY_GUILD_IDS = [
+    g for g in (_int_or_zero(x) for x in os.environ.get("GIVEAWAY_GUILD_IDS", "").split(",")) if g
+]
+
 # Discord's own limits.
 EMBED_DESCRIPTION_MAX = 4096
 REPLY_SOFT_MAX = 1400          # keep it readable in a busy channel
@@ -67,7 +94,7 @@ REQUEST_TIMEOUT = 12
 # "restart" on a Pterodactyl panel reboots the process with whatever files are
 # already on disk — it does not pull. Without this there is no way to tell a
 # deployed fix from an undeployed one except by guessing at behaviour.
-BUILD = "2026-09-21-register-handler"
+BUILD = "2026-10-11-moai-drop"
 
 GREEN = 0x4A7C4E
 
@@ -876,6 +903,407 @@ async def _handle_more_like_this(payload: discord.RawReactionActionEvent):
     )
 
 
+# ---------------------------------------------------------------- the Weekly Moai Drop
+#
+# /link connects a Discord account to a StoneHead account (the site does the
+# linking; the bot only hands out the link). The weekly round is a post with a
+# 🗿 Enter button: tapping it is the entry, and every day that person used
+# StoneHead that week adds one more, up to 7. The site keeps the entries,
+# counts them and picks the winner. The bot posts, relays and animates.
+#
+# Every reply about someone's entries is EPHEMERAL. How many entries a person
+# has says how often they use the app, so nobody's count is ever posted.
+#
+# A button tap, not a reaction: only an interaction can answer privately, and
+# a DM fails for anyone with server DMs off.
+
+ENTER_EMOJI = "\U0001F5FF"  # 🗿
+ROUND_BUTTON_PREFIXES = ("enter:", "leave:")
+NOT_HOST = "This one's just for the host."
+NUDGE_EVERY = 600  # seconds between asks; the site decides if a nudge is due
+
+
+async def call_api(path: str, payload: dict):
+    """POST to a StoneHead endpoint. Returns (status, body); raises Unavailable."""
+    assert session is not None
+    headers = {"X-Bot-Secret": BOT_SECRET, "Content-Type": "application/json"}
+    try:
+        async with session.post(
+            f"{API_BASE}/{path}",
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+        ) as res:
+            if res.status == 401:
+                log.error("%s rejected the shared secret, check STONEHEAD_BOT_SECRET", path)
+                raise Unavailable()
+            try:
+                data = await res.json()
+            except (aiohttp.ContentTypeError, ValueError):
+                log.error("%s answered with something that isn't JSON (status %s)", path, res.status)
+                raise Unavailable()
+            return res.status, data if isinstance(data, dict) else {}
+    except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+        log.info("%s unreachable: %s", path, err)
+        raise Unavailable()
+
+
+def is_host(user) -> bool:
+    """The owner check. By user id only, never roles or permissions."""
+    return bool(OWNER_DISCORD_ID) and getattr(user, "id", None) == OWNER_DISCORD_ID
+
+
+def link_view(url: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Link my StoneHead account", url=url))
+    return view
+
+
+def enter_view(round_id: int, *, closed: bool = False) -> discord.ui.View:
+    """The 🗿 Enter button on a round post. Handled in on_interaction by its
+    custom_id, so it keeps working across restarts."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        style=discord.ButtonStyle.secondary if closed else discord.ButtonStyle.success,
+        label="Entries closed" if closed else "Enter",
+        emoji=ENTER_EMOJI,
+        custom_id=f"enter:{round_id}",
+        disabled=closed,
+    ))
+    return view
+
+
+def leave_view(round_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        style=discord.ButtonStyle.secondary, label="Leave this week", custom_id=f"leave:{round_id}",
+    ))
+    return view
+
+
+def entry_reply_view(data: dict):
+    """The button under a private entry reply: a link while unlinked, Leave once in."""
+    if data.get("link_url"):
+        return link_view(data["link_url"])
+    if data.get("status") == "entered" and data.get("round_id"):
+        return leave_view(int(data["round_id"]))
+    return None
+
+
+def safe_name(name) -> str:
+    """A Discord display name, safe to print in a channel."""
+    text = discord.utils.escape_mentions(discord.utils.escape_markdown(str(name or "someone")))
+    return text[:40] or "someone"
+
+
+def spin_frames(names, *, frames: int = 8):
+    """(text, delay before showing it) for the spin, slowing toward the end.
+
+    Never faster than one edit per 0.8s, which keeps a run of edits well under
+    Discord's limit. The winner is picked before the first frame; this is
+    only the show, and the last frame is replaced by the result.
+    """
+    pool = [safe_name(n) for n in names if n] or ["..."]
+    out = []
+    for i in range(frames):
+        delay = round(0.8 + 0.005 * i * i, 3)  # 0.8s up to ~1.05s: about 7s in all
+        out.append((f"{ENTER_EMOJI} Spinning... **{pool[i % len(pool)]}**", delay))
+    return out
+
+
+def result_text(data: dict) -> str:
+    people = data.get("total_people") or 0
+    entries = data.get("total_entries") or 0
+    return (
+        f"{ENTER_EMOJI} **<@{int(data['winner_discord_id'])}>** wins this week's Moai Drop! "
+        f"{data.get('prize') or ''}. {people} {'person' if people == 1 else 'people'}, "
+        f"{entries} {'entry' if entries == 1 else 'entries'}."
+    )
+
+
+async def close_round_post(channel_id, message_id, round_id) -> None:
+    """Grey out a round's Enter button after a draw or a cancel."""
+    if not channel_id or not message_id:
+        return
+    try:
+        channel = client.get_channel(int(channel_id)) or await client.fetch_channel(int(channel_id))
+        message = await channel.fetch_message(int(message_id))
+        await message.edit(view=enter_view(int(round_id), closed=True))
+    except (discord.HTTPException, ValueError) as err:
+        log.info("could not close the round post %s: %s", message_id, err)
+
+
+@tree.command(name="link", description="Connect your Discord to your StoneHead account")
+async def link(interaction: discord.Interaction):
+    # Private, and fine anywhere the bot can see: it says nothing about strains.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        status, data = await call_api("bot-link-start", {
+            "discord_id": str(interaction.user.id),
+            "discord_username": interaction.user.display_name,
+        })
+    except Unavailable:
+        status, data = 0, {}
+    if status == 429:
+        await interaction.followup.send(
+            "You just made a few links. Use the newest one, or try again in 10 minutes.", ephemeral=True
+        )
+        return
+    if status != 200 or not data.get("url"):
+        await interaction.followup.send("Couldn't make a link right now. Try again in a minute.", ephemeral=True)
+        return
+    await interaction.followup.send(
+        "Tap to link your StoneHead account. Link works for 15 minutes.",
+        view=link_view(data["url"]),
+        ephemeral=True,
+    )
+    log.info("link made guild=%s", interaction.guild_id)
+
+
+@tree.command(name="entries", description="Check your entries in this week's Moai Drop")
+async def entries(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        status, data = await call_api("bot-round-enter", {
+            "action": "status",
+            "guild_id": str(interaction.guild_id) if interaction.guild_id else None,
+            "discord_id": str(interaction.user.id),
+            "discord_username": interaction.user.display_name,
+        })
+    except Unavailable:
+        status, data = 0, {}
+    if status != 200 or not data.get("message"):
+        await interaction.followup.send("Couldn't check right now. Try again in a minute.", ephemeral=True)
+        return
+    view = entry_reply_view(data)
+    if view is None:
+        await interaction.followup.send(data["message"], ephemeral=True)
+    else:
+        await interaction.followup.send(data["message"], view=view, ephemeral=True)
+
+
+async def handle_round_button(interaction: discord.Interaction, custom_id: str) -> None:
+    """🗿 Enter on a round post, or Leave this week under a private reply."""
+    action, _, raw_id = custom_id.partition(":")
+    if not raw_id.isdigit():
+        return
+    if not channel_allows(interaction):
+        await interaction.response.send_message(
+            "This one only works in age-restricted channels.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        status, data = await call_api("bot-round-enter", {
+            "action": action,
+            "round_id": int(raw_id),
+            "discord_id": str(interaction.user.id),
+            "discord_username": interaction.user.display_name,
+        })
+    except Unavailable:
+        status, data = 0, {}
+    if status != 200 or not data.get("message"):
+        await interaction.followup.send("Couldn't reach StoneHead. Tap again in a minute.", ephemeral=True)
+        return
+    view = entry_reply_view(data)
+    if view is None:
+        await interaction.followup.send(data["message"], ephemeral=True)
+    else:
+        await interaction.followup.send(data["message"], view=view, ephemeral=True)
+    log.info("round %s %s -> %s", raw_id, action, data.get("status"))
+
+
+@client.event
+async def on_interaction(interaction: discord.Interaction):
+    """Round buttons, by custom_id. Slash commands and the strain picker are
+    handled by the command tree and their views; this only claims its own."""
+    if interaction.type is not discord.InteractionType.component:
+        return
+    custom_id = (interaction.data or {}).get("custom_id", "")
+    if not custom_id.startswith(ROUND_BUTTON_PREFIXES):
+        return
+    try:
+        await handle_round_button(interaction, custom_id)
+    except Exception:
+        log.exception("round button blew up: %s", custom_id)
+
+
+class Giveaway(app_commands.Group):
+    """/giveaway start | draw | cancel. Registered only in GIVEAWAY_GUILD_IDS,
+    and only the host can run it."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if is_host(interaction.user):
+            return True
+        await interaction.response.send_message(NOT_HOST, ephemeral=True)
+        log.info("non-host tried /giveaway user=%s guild=%s", interaction.user.id, interaction.guild_id)
+        return False
+
+    @app_commands.command(name="start", description="Post this week's Moai Drop")
+    @app_commands.describe(
+        prize="What the winner gets, as shown in the post",
+        bonus_days="Free days for everyone who enters (0 for none)",
+        pass_days="Pass days the winner gets (0 if the prize isn't a pass)",
+    )
+    async def start(
+        self,
+        interaction: discord.Interaction,
+        prize: str,
+        bonus_days: app_commands.Range[int, 0, 30] = 0,
+        pass_days: app_commands.Range[int, 0, 365] = 30,
+    ):
+        if interaction.guild_id is None or not channel_allows(interaction):
+            await interaction.response.send_message(
+                "Start it in an age-restricted channel of the server.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            status, data = await call_api("bot-round-create", {
+                "invoker_discord_id": str(interaction.user.id),
+                "guild_id": str(interaction.guild_id),
+                "channel_id": str(interaction.channel_id),
+                "prize": prize,
+                "bonus_days": bonus_days,
+                "pass_days": pass_days,
+            })
+        except Unavailable:
+            status, data = 0, {}
+        if status != 200 or not data.get("round_id"):
+            await interaction.followup.send(data.get("message") or "Couldn't start it. Try again in a minute.", ephemeral=True)
+            return
+        round_id = int(data["round_id"])
+        try:
+            post = await interaction.channel.send(data["post_text"], view=enter_view(round_id))
+        except discord.HTTPException as err:
+            log.error("could not post round %s: %s", round_id, err)
+            await interaction.followup.send(
+                "The round exists but I couldn't post in this channel. Check my permissions, "
+                "then /giveaway cancel and start again.",
+                ephemeral=True,
+            )
+            return
+        try:
+            await call_api("bot-round-message", {
+                "invoker_discord_id": str(interaction.user.id),
+                "round_id": round_id,
+                "message_id": str(post.id),
+            })
+        except Unavailable:
+            log.error("round %s posted but its message id wasn't saved", round_id)
+        await interaction.followup.send(
+            f"Round {round_id} is up. Run /giveaway draw here on Sunday.", ephemeral=True
+        )
+        log.info("round %s started guild=%s bonus=%s", round_id, interaction.guild_id, bonus_days)
+
+    @app_commands.command(name="draw", description="Draw this week's Moai Drop winner, live")
+    async def draw(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            status, data = await call_api("bot-round-draw", {
+                "invoker_discord_id": str(interaction.user.id),
+                "guild_id": str(interaction.guild_id),
+            })
+        except Unavailable:
+            status, data = 0, {}
+        if status != 200 or data.get("status") not in ("ok", "no_entries"):
+            await interaction.followup.send(data.get("message") or "Couldn't draw. Try again in a minute.", ephemeral=True)
+            return
+
+        await close_round_post(data.get("channel_id"), data.get("message_id"), data.get("round_id"))
+        channel = interaction.channel
+        if data.get("channel_id"):
+            channel = client.get_channel(int(data["channel_id"])) or channel
+
+        if data["status"] == "no_entries":
+            await channel.send(f"{ENTER_EMOJI} No counted entries this week. Watch for next week's post.")
+            await interaction.followup.send("Drawn: nobody counted.", ephemeral=True)
+            return
+
+        await spin(channel, data)
+        note = "Drawn."
+        if data.get("winner_is_founder"):
+            note += " Heads up: the winner is a founder, so no pass was granted. Give them a substitute prize."
+        await interaction.followup.send(note, ephemeral=True)
+
+    @app_commands.command(name="cancel", description="Call off this week's Moai Drop")
+    async def cancel(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            status, data = await call_api("bot-round-cancel", {
+                "invoker_discord_id": str(interaction.user.id),
+                "guild_id": str(interaction.guild_id),
+            })
+        except Unavailable:
+            status, data = 0, {}
+        if status != 200 or data.get("status") != "ok":
+            await interaction.followup.send(data.get("message") or "Couldn't cancel. Try again in a minute.", ephemeral=True)
+            return
+        await close_round_post(data.get("channel_id"), data.get("message_id"), data.get("round_id"))
+        await interaction.followup.send("Round cancelled. Nobody was granted anything.", ephemeral=True)
+
+
+async def spin(channel, data: dict) -> None:
+    """The show: one message, edited through the names, landing on the winner."""
+    winner = int(data["winner_discord_id"])
+    try:
+        message = await channel.send(f"{ENTER_EMOJI} Spinning...")
+        for text, delay in spin_frames(data.get("spin_names") or []):
+            await asyncio.sleep(delay)
+            await message.edit(content=text)
+        await asyncio.sleep(0.9)
+        await message.edit(
+            content=result_text(data),
+            allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=winner)]),
+        )
+    except discord.HTTPException as err:
+        # The winner is already decided and granted; just say it plainly.
+        log.info("spin failed, posting the result instead: %s", err)
+        await channel.send(
+            result_text(data),
+            allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=winner)]),
+        )
+
+
+async def nudge_once() -> None:
+    """Ask the site whether a round is due its 6 PM 'finish linking' line."""
+    try:
+        status, data = await call_api("bot-round-nudge", {})
+    except Unavailable:
+        return
+    if status != 200:
+        return
+    for item in data.get("nudges") or []:
+        try:
+            channel = client.get_channel(int(item["channel_id"])) or await client.fetch_channel(int(item["channel_id"]))
+            if channel_ok(channel):
+                await channel.send(item["message"], allowed_mentions=discord.AllowedMentions.none())
+        except (discord.HTTPException, KeyError, ValueError) as err:
+            log.info("nudge for round %s failed: %s", item.get("round_id"), err)
+
+
+nudge_task: "asyncio.Task | None" = None
+
+
+async def nudge_loop() -> None:
+    while True:
+        await nudge_once()
+        await asyncio.sleep(NUDGE_EVERY)
+
+
+def start_nudge_loop() -> None:
+    """Once per process, and only where giveaways can run."""
+    global nudge_task
+    if GIVEAWAY_GUILD_IDS and (nudge_task is None or nudge_task.done()):
+        nudge_task = asyncio.get_running_loop().create_task(nudge_loop())
+
+
+if GIVEAWAY_GUILD_IDS:
+    tree.add_command(
+        Giveaway(name="giveaway", description="Run the Weekly Moai Drop (host only)"),
+        guilds=[discord.Object(id=g) for g in GIVEAWAY_GUILD_IDS],
+    )
+
 # ---------------------------------------------------------------- lifecycle
 
 @client.event
@@ -889,7 +1317,15 @@ async def on_ready():
     # calls against the limit that exists to stop exactly that.
     if not commands_synced:
         await tree.sync()
+        # /giveaway lives only in the allowed servers. A server the bot isn't
+        # in (yet) refuses the sync; that's logged, not fatal.
+        for guild_id in GIVEAWAY_GUILD_IDS:
+            try:
+                await tree.sync(guild=discord.Object(id=guild_id))
+            except discord.HTTPException as err:
+                log.info("could not sync /giveaway to guild %s: %s", guild_id, err)
         commands_synced = True
+    start_nudge_loop()
     log.info(
         "connected as %s — in %d servers — build %s — intents(reactions=%s, guilds=%s)",
         client.user, len(client.guilds), BUILD,
