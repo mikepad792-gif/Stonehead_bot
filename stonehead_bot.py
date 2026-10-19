@@ -77,6 +77,12 @@ def _int_or_zero(raw) -> int:
 # The site checks the same id again on every giveaway call.
 OWNER_DISCORD_ID = _int_or_zero(os.environ.get("OWNER_DISCORD_ID"))
 
+# Who can run /drop-entries (read-only entry list), comma-separated. The
+# host is always included. This list says nothing about who can enter or win.
+ADMIN_DISCORD_IDS = {
+    a for a in (_int_or_zero(x) for x in os.environ.get("ADMIN_DISCORD_IDS", "").split(",")) if a
+}
+
 # Servers where /giveaway exists at all. It is registered as a guild command
 # in these only, never globally, so no other server ever sees it.
 GIVEAWAY_GUILD_IDS = [
@@ -94,7 +100,7 @@ REQUEST_TIMEOUT = 12
 # "restart" on a Pterodactyl panel reboots the process with whatever files are
 # already on disk — it does not pull. Without this there is no way to tell a
 # deployed fix from an undeployed one except by guessing at behaviour.
-BUILD = "2026-10-11-moai-drop"
+BUILD = "2026-10-19-drop-entries"
 
 GREEN = 0x4A7C4E
 
@@ -953,6 +959,11 @@ def is_host(user) -> bool:
     return bool(OWNER_DISCORD_ID) and getattr(user, "id", None) == OWNER_DISCORD_ID
 
 
+def is_admin(user) -> bool:
+    """/drop-entries viewers: ADMIN_DISCORD_IDS plus the host. By user id only."""
+    return is_host(user) or getattr(user, "id", None) in ADMIN_DISCORD_IDS
+
+
 def link_view(url: str) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Link my StoneHead account", url=url))
@@ -1298,7 +1309,90 @@ def start_nudge_loop() -> None:
         nudge_task = asyncio.get_running_loop().create_task(nudge_loop())
 
 
+
+# /drop-entries: who's in this server's current drop and with how many
+# entries. READ ONLY. The site counts through the same function the draw
+# picks from, so this list is the draw pool. Hidden from members by default
+# (Manage Server), and the user id is checked here and again by the site.
+DISCORD_MESSAGE_MAX = 2000
+
+
+def entries_report(data: dict):
+    """(text, csv_or_None). The CSV only when the list won't fit in one message."""
+    round_ = data.get("round") or {}
+    entrants = data.get("entrants") or []
+    head = [
+        f"{ENTER_EMOJI} **Moai Drop entries** ({round_.get('status', '?')})",
+        f"Drop: {data.get('dates_label', '?')} · draw {data.get('draw_label', '?')}",
+        f"{data.get('total_people', 0)} entrants · {data.get('total_entries', 0)} entries",
+    ]
+    extra = []
+    if data.get("not_counted"):
+        extra.append(f"{data['not_counted']} tapped Enter but aren't counted (not linked yet, or a staff account)")
+    if data.get("left"):
+        extra.append(f"{data['left']} left this week")
+    if extra:
+        head.append(" · ".join(extra))
+
+    def name(e):
+        return safe_name(e.get("discord_name") or "unknown")
+
+    rows = [
+        f"{i}. {name(e)} ({safe_name(e.get('username') or 'no username')}): "
+        f"link {e.get('link_entry', 1)} + {e.get('days', 0)} days = **{e.get('total', 0)}**"
+        for i, e in enumerate(entrants, 1)
+    ]
+    text = "\n".join(head + ([""] + rows if rows else ["", "Nobody counted yet."]))
+    if len(text) <= DISCORD_MESSAGE_MAX:
+        return text, None
+
+    import csv
+    import io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["discord_name", "stonehead_username", "link_entry", "days_used", "total"])
+    for e in entrants:
+        writer.writerow([e.get("discord_name") or "", e.get("username") or "",
+                         e.get("link_entry", 1), e.get("days", 0), e.get("total", 0)])
+    summary = "\n".join(head + ["", "Full list attached as a .csv."])
+    return summary, buf.getvalue()
+
+
+@app_commands.command(name="drop-entries", description="See everyone in this week's Moai Drop (admins)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def drop_entries(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(NOT_HOST, ephemeral=True)
+        log.info("non-admin tried /drop-entries user=%s guild=%s", interaction.user.id, interaction.guild_id)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        status, data = await call_api("bot-round-entries", {
+            "invoker_discord_id": str(interaction.user.id),
+            "guild_id": str(interaction.guild_id),
+        })
+    except Unavailable:
+        status, data = 0, {}
+    if status != 200 or data.get("status") not in ("ok", "no_round"):
+        await interaction.followup.send(data.get("message") or "Couldn't load entries. Try again in a minute.", ephemeral=True)
+        return
+    if data["status"] == "no_round":
+        await interaction.followup.send(data.get("message") or "No Moai Drop in this server yet.", ephemeral=True)
+        return
+    text, csv_text = entries_report(data)
+    if csv_text is None:
+        await interaction.followup.send(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    else:
+        import io
+        file = discord.File(io.BytesIO(csv_text.encode("utf-8")), filename="moai-drop-entries.csv")
+        await interaction.followup.send(text, file=file, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
 if GIVEAWAY_GUILD_IDS:
+    tree.add_command(
+        drop_entries,
+        guilds=[discord.Object(id=g) for g in GIVEAWAY_GUILD_IDS],
+    )
     tree.add_command(
         Giveaway(name="giveaway", description="Run the Weekly Moai Drop (host only)"),
         guilds=[discord.Object(id=g) for g in GIVEAWAY_GUILD_IDS],

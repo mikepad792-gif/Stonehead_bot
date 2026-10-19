@@ -20,6 +20,7 @@ import sys
 os.environ.setdefault("STONEHEAD_BOT_SECRET", "test-secret")
 os.environ["OWNER_DISCORD_ID"] = "1520166782013542422"
 os.environ["GIVEAWAY_GUILD_IDS"] = "788166388250443846"
+os.environ["ADMIN_DISCORD_IDS"] = "400000000000000001, 400000000000000002"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import discord  # noqa: E402
@@ -767,8 +768,8 @@ check("M1 owner and giveaway servers come from the environment",
 check("M2 /link and /entries are global; /giveaway is not",
       sorted(c.name for c in B.tree.get_commands()) == ["entries", "link", "strain"],
       [c.name for c in B.tree.get_commands()])
-check("M2 /giveaway exists only in the allowed server",
-      [c.name for c in B.tree.get_commands(guild=discord.Object(id=788166388250443846))] == ["giveaway"]
+check("M2 /giveaway and /drop-entries exist only in the allowed server",
+      sorted(c.name for c in B.tree.get_commands(guild=discord.Object(id=788166388250443846))) == ["drop-entries", "giveaway"]
       and B.tree.get_commands(guild=discord.Object(id=1)) == [])
 
 check("M3 host check is the user id only",
@@ -978,6 +979,65 @@ run(B.nudge_once())
 check("M21 nudge stays quiet in a channel that isn't age-restricted", nudge_channel.sent == [])
 
 B.call_api, B.asyncio.sleep, B.client.get_channel = real_call_api, real_sleep, real_get_channel
+
+# ── /drop-entries (2.2.1) ───────────────────────────────────────────
+print("\n/drop-entries")
+de = B.tree.get_command("drop-entries", guild=discord.Object(id=788166388250443846))
+check("D1 hidden from members by default (Manage Server) and server-only",
+      de is not None and de.default_permissions is not None and de.default_permissions.manage_guild
+      and de.guild_only)
+check("D1 admins come from ADMIN_DISCORD_IDS, and the host is always one",
+      B.ADMIN_DISCORD_IDS == {400000000000000001, 400000000000000002}
+      and B.is_admin(type("U", (), {"id": 400000000000000002})())
+      and B.is_admin(type("U", (), {"id": OWNER})())
+      and not B.is_admin(type("U", (), {"id": 42})()))
+
+calls.clear()
+B.call_api = fake_api({"bot-round-entries": (200, {"status": "ok"})})
+member = FakeInteraction(user_id=42)
+run(de.callback(member))
+check("D2 a regular member gets the refusal and the site isn't asked",
+      calls == [] and member.response.messages == [{"content": "This one's just for the host.", "ephemeral": True}])
+
+report = {
+    "status": "ok", "round": {"id": 7, "status": "open"},
+    "dates_label": "Mon, Oct 19 to Sun, Oct 25", "draw_label": "Sun, Oct 25, 9:00 PM PT",
+    "total_people": 2, "total_entries": 9, "not_counted": 1, "left": 0,
+    "entrants": [
+        {"discord_name": "high", "username": "highuser", "link_entry": 1, "days": 6, "total": 7},
+        {"discord_name": "@everyone", "username": None, "link_entry": 1, "days": 1, "total": 2},
+    ],
+}
+calls.clear()
+B.call_api = fake_api({"bot-round-entries": (200, report)})
+admin = FakeInteraction(user_id=400000000000000002)
+run(de.callback(admin))
+sent = admin.followup.sent[0] if admin.followup.sent else {}
+text = sent.get("content") or ""
+check("D3 an admin gets a private list for this server",
+      calls == [("bot-round-entries", {"invoker_discord_id": "400000000000000002", "guild_id": "7"})]
+      and sent.get("ephemeral") is True, calls)
+check("D3 header: dates, draw time, entrants, entries, and who isn't counted",
+      "Mon, Oct 19 to Sun, Oct 25" in text and "Sun, Oct 25, 9:00 PM PT" in text
+      and "2 entrants · 9 entries" in text and "1 tapped Enter but aren't counted" in text, text)
+check("D3 rows in the site's order: name, StoneHead username, link + days = total",
+      "1. high (highuser): link 1 + 6 days = **7**" in text and text.index("high (") < text.index("everyone"), text)
+check("D3 names can't ping", "@everyone" not in text, text)
+
+big = dict(report, entrants=[{"discord_name": f"person{i}", "username": f"user{i}", "link_entry": 1, "days": i % 8, "total": 1 + i % 8} for i in range(120)])
+txt, csv_text = B.entries_report(big)
+check("D4 a list too long for one message comes as a .csv with a summary",
+      csv_text is not None and len(txt) <= 2000 and "attached as a .csv" in txt
+      and csv_text.splitlines()[0] == "discord_name,stonehead_username,link_entry,days_used,total"
+      and len(csv_text.strip().splitlines()) == 121)
+small_txt, small_csv = B.entries_report(report)
+check("D4 a short list stays inline", small_csv is None and len(small_txt) <= 2000)
+
+B.call_api = fake_api({"bot-round-entries": (200, {"status": "no_round", "message": "No Moai Drop running right now. Watch for the next post."})})
+admin = FakeInteraction(user_id=OWNER)
+run(de.callback(admin))
+check("D5 no round says so", "No Moai Drop" in (admin.followup.sent[0]["content"] or ""))
+B.call_api = real_call_api
 
 print()
 if FAILURES:

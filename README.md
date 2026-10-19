@@ -38,6 +38,14 @@ Three more commands, all answered privately (only the person sees the reply):
 3. `/giveaway` is registered as a guild command only in the servers in
    `GIVEAWAY_GUILD_IDS`, never globally. No other server sees it.
 
+**`/drop-entries`** (admins) lists everyone counted in this server's current
+drop, privately: dates, draw time, totals, and one row per person (Discord
+name, StoneHead username, link entry, days used, total), sorted by total. It
+reads the same count the draw uses, so it is the draw pool. Too long for one
+message, it comes as a .csv. It is hidden from members unless they have Manage
+Server (a server can change that under Server Settings, Integrations), and the
+user ID is checked against `ADMIN_DISCORD_IDS` by the bot and by the site.
+
 `start` posts the round in the (age-restricted) channel it's run in. `draw`
 asks the site to pick the winner (the site counts the entries, picks with a
 crypto random number, grants the pass days, and locks the round), greys out the
@@ -207,6 +215,7 @@ press, and a reaction the bot answers itself are all silent failures.
 | `LOG_REACTIONS` | Optional. `1` prints every raw reaction event the process receives, with code points. For debugging the 🔁 button; noisy in a busy channel. |
 | `REQUIRE_AGE_RESTRICTED` | Optional. Defaults to on. `0` disables the age gate — testing only. |
 | `OWNER_DISCORD_ID` | Moai Drop host. The one Discord user ID that can run `/giveaway`. Unset means nobody. Must match the site's `OWNER_DISCORD_ID`. |
+| `ADMIN_DISCORD_IDS` | Who can run `/drop-entries`, comma-separated Discord user IDs. The host (`OWNER_DISCORD_ID`) always can. Only controls who can read the list; admins enter and win like anyone else. |
 | `GIVEAWAY_GUILD_IDS` | Servers where `/giveaway` is registered, comma-separated. Unset means `/giveaway` doesn't exist anywhere. Must match the site's. |
 | `STONEHEAD_API_URL` | Optional. Base for the linking and Moai Drop endpoints. Defaults to `STONEHEAD_API` without `/strain-lookup`. |
 
