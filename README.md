@@ -58,6 +58,21 @@ untagged line if anyone tapped Enter without finishing linking.
 The bot keeps none of this. Entries, links and the draw all live on the site
 (migration 024 in the StoneHead repo); the bot only relays.
 
+## Versions
+
+The bot has its own version number, separate from the StoneHead app. It's in
+`VERSION` at the top of `stonehead_bot.py` and in the console when the bot
+connects (`connected as ... v1.2.0 (build ...)`), so you can tell what's
+actually running after a restart. A new command or feature is a minor bump; a
+fix is a patch.
+
+- **1.2.0** (Oct 19, 2026): `/drop-entries`, the admin-only list of who's in
+  the current Moai Drop. Needs StoneHead 2.2.1 and `ADMIN_DISCORD_IDS`.
+- **1.1.0** (Oct 11, 2026): the Weekly Moai Drop. `/link`, the 🗿 Enter
+  button, `/entries`, and host-only `/giveaway`. Needs StoneHead 2.2.0.
+- **1.0.0** (Sept 2026): `/strain`, the family picker, and the 🔁 more-like-this
+  button.
+
 ## How it fits together
 
 ```

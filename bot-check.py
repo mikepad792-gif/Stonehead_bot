@@ -634,6 +634,10 @@ check("P10b ...and does not propagate out of the handler", True)
 # A build marker exists, so "is the fix deployed" is answerable from the boot
 # log instead of inferred from behaviour.
 check("P10c the build marker is set", bool(getattr(B, "BUILD", "")), getattr(B, "BUILD", None))
+import re as _re
+check("P10d the version is MAJOR.MINOR.PATCH", bool(_re.fullmatch(r"\d+\.\d+\.\d+", getattr(B, "VERSION", ""))), getattr(B, "VERSION", None))
+_readme = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")).read()
+check("P10e README's Versions list has the current version", f"**{B.VERSION}**" in _readme)
 
 # ── P11: the emoji comparison is the one silent path ────────────────
 #

@@ -96,6 +96,12 @@ REPLY_SOFT_MAX = 1400          # keep it readable in a busy channel
 # Client-side timeout. The endpoint itself is bounded by Netlify's 10s.
 REQUEST_TIMEOUT = 12
 
+# The bot's own version, separate from the app's (they ship on their own
+# schedules). Bump it with every change that gets deployed, and add a line to
+# the Versions list in README.md. MAJOR.MINOR.PATCH: a new command or feature
+# is a minor bump, a fix is a patch.
+VERSION = "1.2.0"
+
 # Bumped by hand whenever the bot changes. Logged on connect, because
 # "restart" on a Pterodactyl panel reboots the process with whatever files are
 # already on disk — it does not pull. Without this there is no way to tell a
@@ -1421,8 +1427,8 @@ async def on_ready():
         commands_synced = True
     start_nudge_loop()
     log.info(
-        "connected as %s — in %d servers — build %s — intents(reactions=%s, guilds=%s)",
-        client.user, len(client.guilds), BUILD,
+        "connected as %s — in %d servers — v%s (build %s) — intents(reactions=%s, guilds=%s)",
+        client.user, len(client.guilds), VERSION, BUILD,
         intents.reactions, intents.guilds,
     )
 
