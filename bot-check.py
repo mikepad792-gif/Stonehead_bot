@@ -20,6 +20,7 @@ import sys
 os.environ.setdefault("STONEHEAD_BOT_SECRET", "test-secret")
 os.environ["OWNER_DISCORD_ID"] = "1520166782013542422"
 os.environ["GIVEAWAY_GUILD_IDS"] = "788166388250443846"
+os.environ["ADMIN_DISCORD_IDS"] = "400000000000000001, 400000000000000002"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import discord  # noqa: E402
@@ -94,7 +95,7 @@ class FakeMessage:
     async def add_reaction(self, emoji):
         self.reactions.append(emoji)
 
-    async def reply(self, content=None, embed=None, mention_author=None):
+    async def reply(self, content=None, embed=None, mention_author=None, **kw):
         child = FakeMessage()
         self.replies.append({"content": content, "embed": embed, "message": child})
         return child
@@ -633,6 +634,10 @@ check("P10b ...and does not propagate out of the handler", True)
 # A build marker exists, so "is the fix deployed" is answerable from the boot
 # log instead of inferred from behaviour.
 check("P10c the build marker is set", bool(getattr(B, "BUILD", "")), getattr(B, "BUILD", None))
+import re as _re
+check("P10d the version is MAJOR.MINOR.PATCH", bool(_re.fullmatch(r"\d+\.\d+\.\d+", getattr(B, "VERSION", ""))), getattr(B, "VERSION", None))
+_readme = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")).read()
+check("P10e README's Versions list has the current version", f"**{B.VERSION}**" in _readme)
 
 # ── P11: the emoji comparison is the one silent path ────────────────
 #
@@ -764,11 +769,11 @@ OWNER = 1520166782013542422
 check("M1 API base is the lookup URL minus /strain-lookup", B.API_BASE == "https://stoneheadai.com/api", B.API_BASE)
 check("M1 owner and giveaway servers come from the environment",
       B.OWNER_DISCORD_ID == OWNER and B.GIVEAWAY_GUILD_IDS == [788166388250443846])
-check("M2 /link and /entries are global; /giveaway is not",
-      sorted(c.name for c in B.tree.get_commands()) == ["entries", "link", "strain"],
+check("M2 /link, /entries and /rec are global; /giveaway is not",
+      sorted(c.name for c in B.tree.get_commands()) == ["entries", "link", "rec", "strain"],
       [c.name for c in B.tree.get_commands()])
-check("M2 /giveaway exists only in the allowed server",
-      [c.name for c in B.tree.get_commands(guild=discord.Object(id=788166388250443846))] == ["giveaway"]
+check("M2 /giveaway and /drop-entries exist only in the allowed server",
+      sorted(c.name for c in B.tree.get_commands(guild=discord.Object(id=788166388250443846))) == ["drop-entries", "giveaway"]
       and B.tree.get_commands(guild=discord.Object(id=1)) == [])
 
 check("M3 host check is the user id only",
@@ -978,6 +983,168 @@ run(B.nudge_once())
 check("M21 nudge stays quiet in a channel that isn't age-restricted", nudge_channel.sent == [])
 
 B.call_api, B.asyncio.sleep, B.client.get_channel = real_call_api, real_sleep, real_get_channel
+
+# ── /drop-entries (2.2.1) ───────────────────────────────────────────
+print("\n/drop-entries")
+de = B.tree.get_command("drop-entries", guild=discord.Object(id=788166388250443846))
+check("D1 hidden from members by default (Manage Server) and server-only",
+      de is not None and de.default_permissions is not None and de.default_permissions.manage_guild
+      and de.guild_only)
+check("D1 admins come from ADMIN_DISCORD_IDS, and the host is always one",
+      B.ADMIN_DISCORD_IDS == {400000000000000001, 400000000000000002}
+      and B.is_admin(type("U", (), {"id": 400000000000000002})())
+      and B.is_admin(type("U", (), {"id": OWNER})())
+      and not B.is_admin(type("U", (), {"id": 42})()))
+
+calls.clear()
+B.call_api = fake_api({"bot-round-entries": (200, {"status": "ok"})})
+member = FakeInteraction(user_id=42)
+run(de.callback(member))
+check("D2 a regular member gets the refusal and the site isn't asked",
+      calls == [] and member.response.messages == [{"content": "This one's just for the host.", "ephemeral": True}])
+
+report = {
+    "status": "ok", "round": {"id": 7, "status": "open"},
+    "dates_label": "Mon, Oct 19 to Sun, Oct 25", "draw_label": "Sun, Oct 25, 9:00 PM PT",
+    "total_people": 2, "total_entries": 9, "not_counted": 1, "left": 0,
+    "entrants": [
+        {"discord_name": "high", "username": "highuser", "link_entry": 1, "days": 6, "total": 7},
+        {"discord_name": "@everyone", "username": None, "link_entry": 1, "days": 1, "total": 2},
+    ],
+}
+calls.clear()
+B.call_api = fake_api({"bot-round-entries": (200, report)})
+admin = FakeInteraction(user_id=400000000000000002)
+run(de.callback(admin))
+sent = admin.followup.sent[0] if admin.followup.sent else {}
+text = sent.get("content") or ""
+check("D3 an admin gets a private list for this server",
+      calls == [("bot-round-entries", {"invoker_discord_id": "400000000000000002", "guild_id": "7"})]
+      and sent.get("ephemeral") is True, calls)
+check("D3 header: dates, draw time, entrants, entries, and who isn't counted",
+      "Mon, Oct 19 to Sun, Oct 25" in text and "Sun, Oct 25, 9:00 PM PT" in text
+      and "2 entrants · 9 entries" in text and "1 tapped Enter but aren't counted" in text, text)
+check("D3 rows in the site's order: name, StoneHead username, link + days = total",
+      "1. high (highuser): link 1 + 6 days = **7**" in text and text.index("high (") < text.index("everyone"), text)
+check("D3 names can't ping", "@everyone" not in text, text)
+
+big = dict(report, entrants=[{"discord_name": f"person{i}", "username": f"user{i}", "link_entry": 1, "days": i % 8, "total": 1 + i % 8} for i in range(120)])
+txt, csv_text = B.entries_report(big)
+check("D4 a list too long for one message comes as a .csv with a summary",
+      csv_text is not None and len(txt) <= 2000 and "attached as a .csv" in txt
+      and csv_text.splitlines()[0] == "discord_name,stonehead_username,link_entry,days_used,total"
+      and len(csv_text.strip().splitlines()) == 121)
+small_txt, small_csv = B.entries_report(report)
+check("D4 a short list stays inline", small_csv is None and len(small_txt) <= 2000)
+
+B.call_api = fake_api({"bot-round-entries": (200, {"status": "no_round", "message": "No Moai Drop running right now. Watch for the next post."})})
+admin = FakeInteraction(user_id=OWNER)
+run(de.callback(admin))
+check("D5 no round says so", "No Moai Drop" in (admin.followup.sent[0]["content"] or ""))
+B.call_api = real_call_api
+
+# ── /rec ────────────────────────────────────────────────────────────
+print("\n/rec")
+GDP = {"reply": "Granddaddy Purple, the heavy one. Grape and berry, sinks you into the couch.",
+       "matched": True, "strain": "Granddaddy-Purple", "tier": "rec", "fit": "good",
+       "strain_data": {"type": "indica", "effects": ["Relaxed", "Sleepy", "Happy"], "flavor": ["Grape", "Berry", "Sweet"], "rating": 4.4}}
+rec_cmd = B.tree.get_command("rec")
+fs = fresh_session(200, GDP)
+inter = FakeInteraction(user_id=42)
+inter.user.display_name = "Chaos"
+run(rec_cmd.callback(inter, "  what's something good for a lazy Sunday  "))
+sent = inter.followup.sent[0] if inter.followup.sent else {}
+emb = sent.get("embed")
+fields = {f.name: f.value for f in emb.fields} if emb else {}
+check("R1 /rec sends mode rec with the trimmed ask, through the same endpoint and secret",
+      fs.requests == [{"mode": "rec", "query": "what's something good for a lazy Sunday", "discord_user_id": "42", "guild_id": "7"}]
+      and fs.urls == [B.API_URL], fs.requests)
+check("R2 the ask stays visible: 'Chaos asked: ...' above the card",
+      sent.get("content") == "**Chaos** asked: what's something good for a lazy Sunday", sent.get("content"))
+check("R2 the card is a /strain card: strain name, StoneHead's take, type/effects/flavour/rating, same footer",
+      emb is not None and emb.title == "Granddaddy Purple" and emb.description.startswith("Granddaddy Purple, the heavy one")
+      and fields == {"Type": "indica", "Effects": "Relaxed, Sleepy, Happy", "Flavour": "Grape, Berry, Sweet", "Rating": "4.4/5"}
+      and emb.footer.text == "StoneHead AI · full conversations at stoneheadai.com", fields)
+card = FakeMessage()
+inter2 = FakeInteraction()
+inter2.user.display_name = "Chaos"
+async def _send(content=None, embed=None, wait=False, **kw):
+    card.content, card.embed = content, embed
+    return card
+inter2.followup.send = _send
+fs = fresh_session(200, GDP)
+run(rec_cmd.callback(inter2, "lazy sunday"))
+check("R3 the card carries 🔄 and remembers the ask and the strain shown",
+      card.reactions == [B.REC_EMOJI] and B.REC_CARDS.get(card.id) == {"ask": "lazy sunday", "shown": ["Granddaddy-Purple"]}, card.reactions)
+check("R3 🔄 is not 🔁 (that one means more like this strain)", not B.same_emoji(B.REC_EMOJI, B.MORE_EMOJI))
+
+check("R4 the asked line can't ping or format",
+      "@everyone" not in B.asked_line("x", "@everyone **free weed**") and "**free weed**" not in B.asked_line("x", "@everyone **free weed**"))
+
+# 🔄 tap: another strain for the same ask, excluding what's been shown, posted under the card.
+chan = FakeChannel()
+chan.messages[card.id] = card
+real_client = B.client
+B.client = FakeClient(chan)
+BD = dict(GDP, strain="Blue-Dream", reply="Blue Dream, the easy one.",
+          strain_data={"type": "hybrid", "effects": ["Relaxed", "Happy"], "flavor": ["Berry", "Sweet"], "rating": 4.4})
+fs = fresh_session(200, BD)
+run(B.on_raw_reaction_add(FakePayload(card.id, user_id=77, emoji=B.REC_EMOJI)))
+reply = card.replies[0] if card.replies else {}
+check("R5 🔄 asks again with the same ask, as the tapper, excluding what was shown",
+      fs.requests == [{"mode": "rec", "query": "lazy sunday", "discord_user_id": "77", "guild_id": "7", "exclude_strains": ["Granddaddy-Purple"]}], fs.requests)
+check("R5 the new pick lands under the card as a full card, with its own 🔄",
+      reply.get("content") == "Another pick for: lazy sunday" and reply.get("embed") is not None
+      and reply["embed"].title == "Blue Dream" and reply["message"].reactions == [B.REC_EMOJI], reply)
+check("R5 the chain remembers both, shared across its cards",
+      B.REC_CARDS.get(reply["message"].id) is B.REC_CARDS.get(card.id)
+      and B.REC_CARDS[card.id]["shown"] == ["Granddaddy-Purple", "Blue-Dream"])
+
+chan.messages[reply["message"].id] = reply["message"]
+fs = fresh_session(200, {"reply": "That's every strain in my notes that fits that ask. Try loosening it up or asking for something different.", "tier": "rec_all_shown", "strain": None})
+run(B.on_raw_reaction_add(FakePayload(reply["message"].id, user_id=77, emoji=B.REC_EMOJI)))
+chan_text = [r.get("content") for r in reply["message"].replies] + [m.get("content") for m in chan.sent]
+check("R6 out of picks: the site's line, no new card", any("every strain in my notes" in (t or "") for t in chan_text), chan_text)
+
+fs = fresh_session(200, BD)
+before = len(fs.requests)
+run(B.on_raw_reaction_add(FakePayload(card.id, user_id=555, emoji=B.REC_EMOJI)))
+check("R7 the bot's own 🔄 is ignored", fs.requests == [])
+
+nsfw_off = FakeChannel(nsfw=False)
+nsfw_off.messages[card.id] = card
+B.client = FakeClient(nsfw_off)
+fs = fresh_session(200, BD)
+run(B.on_raw_reaction_add(FakePayload(card.id, user_id=77, emoji=B.REC_EMOJI)))
+check("R8 🔄 in a channel that lost its age flag stays silent", fs.requests == [] and nsfw_off.sent == [])
+B.client = real_client
+
+fs = fresh_session(200, GDP)
+inter = FakeInteraction()
+inter.channel = FakeChannel(nsfw=False)
+run(rec_cmd.callback(inter, "something chill"))
+check("R9 same age gate as /strain", fs.requests == [] and inter.response.messages and inter.response.messages[0]["ephemeral"])
+
+fs = fresh_session(429, {})
+inter = FakeInteraction()
+run(rec_cmd.callback(inter, "something chill"))
+check("R10 over the shared /strain limit: the same easy-does-it line, privately",
+      inter.followup.sent[0]["content"] == "Easy. Give it a few minutes and ask again." and inter.followup.sent[0]["ephemeral"])
+
+fs = fresh_session(200, {"reply": "Give me a little more to go on.", "tier": "rec_vague", "strain": None, "strain_data": None})
+inter = FakeInteraction()
+inter.user.display_name = "Chaos"
+run(rec_cmd.callback(inter, "something good"))
+emb = inter.followup.sent[0]["embed"]
+check("R11 a fixed site line (vague, nothing fits, no sourcing) still shows the ask, no fields",
+      inter.followup.sent[0]["content"] == "**Chaos** asked: something good" and emb.description == "Give me a little more to go on." and len(emb.fields) == 0)
+
+fs = fresh_session(200, GDP)
+for bad in ["   ", "x" * 201]:
+    inter = FakeInteraction()
+    run(rec_cmd.callback(inter, bad))
+    check(f"R12 {'blank' if not bad.strip() else 'too long'} is refused before the site is asked",
+          fs.requests == [] and inter.response.messages and inter.response.messages[0]["ephemeral"])
 
 print()
 if FAILURES:

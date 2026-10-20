@@ -77,6 +77,12 @@ def _int_or_zero(raw) -> int:
 # The site checks the same id again on every giveaway call.
 OWNER_DISCORD_ID = _int_or_zero(os.environ.get("OWNER_DISCORD_ID"))
 
+# Who can run /drop-entries (read-only entry list), comma-separated. The
+# host is always included. This list says nothing about who can enter or win.
+ADMIN_DISCORD_IDS = {
+    a for a in (_int_or_zero(x) for x in os.environ.get("ADMIN_DISCORD_IDS", "").split(",")) if a
+}
+
 # Servers where /giveaway exists at all. It is registered as a guild command
 # in these only, never globally, so no other server ever sees it.
 GIVEAWAY_GUILD_IDS = [
@@ -90,11 +96,17 @@ REPLY_SOFT_MAX = 1400          # keep it readable in a busy channel
 # Client-side timeout. The endpoint itself is bounded by Netlify's 10s.
 REQUEST_TIMEOUT = 12
 
+# The bot's own version, separate from the app's (they ship on their own
+# schedules). Bump it with every change that gets deployed, and add a line to
+# the Versions list in README.md. MAJOR.MINOR.PATCH: a new command or feature
+# is a minor bump, a fix is a patch.
+VERSION = "1.2.0"
+
 # Bumped by hand whenever the bot changes. Logged on connect, because
 # "restart" on a Pterodactyl panel reboots the process with whatever files are
 # already on disk — it does not pull. Without this there is no way to tell a
 # deployed fix from an undeployed one except by guessing at behaviour.
-BUILD = "2026-10-11-moai-drop"
+BUILD = "2026-10-20-rec"
 
 GREEN = 0x4A7C4E
 
@@ -650,6 +662,193 @@ async def strain(interaction: discord.Interaction, name: str):
     )
 
 
+# ---------------------------------------------------------------- /rec
+
+# The "another pick" button on a /rec card. Not 🔁: that one already means
+# "more like THIS strain" on /strain cards, and this means "another one for
+# the same ask".
+REC_EMOJI = "\U0001F504"  # 🔄
+
+# What each /rec card was asked, and every strain shown along that chain, so
+# 🔄 never repeats one. Cards in the same chain share one dict. In memory like
+# CARD_STRAINS: a restart costs a dead 🔄 on old cards, nothing more.
+REC_CARDS: "OrderedDict[int, dict]" = OrderedDict()
+
+
+def remember_rec(message, chain: dict) -> None:
+    REC_CARDS[message.id] = chain
+    while len(REC_CARDS) > CARD_MEMORY:
+        REC_CARDS.popitem(last=False)
+
+
+async def ask_rec(looking_for: str, user_id, guild_id, exclude=None):
+    """POST mode "rec". Returns {reply, tier, strain, strain_data}, or raises.
+
+    The site picks the strain, from the database, by effects and flavors; the
+    bot never chooses one. `exclude` is every strain already shown for this ask.
+    """
+    assert session is not None
+    payload = {
+        "mode": "rec",
+        "query": looking_for,
+        "discord_user_id": str(user_id),
+        "guild_id": str(guild_id) if guild_id else None,
+    }
+    if exclude:
+        payload["exclude_strains"] = list(exclude)[-50:]
+    headers = {"X-Bot-Secret": BOT_SECRET, "Content-Type": "application/json"}
+    async with session.post(
+        API_URL,
+        json=payload,
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+    ) as res:
+        if res.status == 429:
+            raise RateLimited()
+        if res.status == 401:
+            log.error("endpoint rejected the shared secret — check STONEHEAD_BOT_SECRET")
+            raise Unavailable()
+        if res.status != 200:
+            body = (await res.text())[:200]
+            log.error("rec failed status=%s body=%s", res.status, body)
+            raise Unavailable()
+        data = await res.json()
+        reply = (data.get("reply") or "").strip()
+        if not reply:
+            raise Unavailable()
+        return {
+            "reply": reply,
+            "tier": data.get("tier"),
+            "strain": data.get("strain"),
+            "strain_data": data.get("strain_data"),
+        }
+
+
+def asked_line(name, looking_for: str) -> str:
+    """'**Chaos** asked: something good for a lazy Sunday', safe to post.
+
+    A slash command's options don't show in the channel, so without this the
+    card answers a question nobody else can see.
+    """
+    ask = discord.utils.escape_mentions(discord.utils.escape_markdown(looking_for))
+    return f"**{safe_name(name)}** asked: {ask}"
+
+
+def rec_card(answer: dict, looking_for: str) -> discord.Embed:
+    """Exactly a /strain card: the strain's name, StoneHead's take, its fields."""
+    return card_embed(answer["reply"], answer.get("strain"), answer.get("strain_data"), fallback_title=looking_for[:256])
+
+
+@tree.command(name="rec", description="Get a strain pick for what you're in the mood for")
+@app_commands.describe(looking_for="e.g. something chill for a movie night, or fruity, not too sleepy")
+async def rec(interaction: discord.Interaction, looking_for: str):
+    if not channel_allows(interaction):
+        await interaction.response.send_message(
+            "This one only works in age-restricted channels. A mod can flag a "
+            "channel 18+ in its settings.",
+            ephemeral=True,
+        )
+        return
+
+    looking_for = looking_for.strip()
+    if not looking_for:
+        await interaction.response.send_message("Tell me what you're in the mood for.", ephemeral=True)
+        return
+    if len(looking_for) > 200:
+        await interaction.response.send_message("That's a long one, shorten it up.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        answer = await ask_rec(looking_for, interaction.user.id, interaction.guild_id)
+    except RateLimited:
+        await interaction.followup.send("Easy. Give it a few minutes and ask again.", ephemeral=True)
+        return
+    except (Unavailable, asyncio.TimeoutError, aiohttp.ClientError):
+        await interaction.followup.send(
+            f"He's not answering right now. Try again in a bit, or come find him at {SITE_URL}",
+            ephemeral=True,
+        )
+        return
+
+    message = await interaction.followup.send(
+        content=asked_line(interaction.user.display_name, looking_for),
+        embed=rec_card(answer, looking_for),
+        allowed_mentions=discord.AllowedMentions.none(),
+        wait=True,
+    )
+    # 🔄 only on a real pick. A "tell me more" or "nothing fits" line has no
+    # next pick to offer.
+    if answer["tier"] == "rec" and answer.get("strain"):
+        try:
+            await message.add_reaction(REC_EMOJI)
+            remember_rec(message, {"ask": looking_for, "shown": [answer["strain"]]})
+        except discord.HTTPException as err:
+            log.info("could not add the another-pick reaction: %s", err)
+    log.info("rec guild=%s user=%s tier=%s strain=%s", interaction.guild_id, interaction.user.id, answer["tier"], answer.get("strain"))
+
+
+async def _handle_another_rec(payload: discord.RawReactionActionEvent):
+    """🔄 on a /rec card: another strain for the same ask, never one already shown."""
+    channel = client.get_channel(payload.channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(payload.channel_id)
+        except discord.HTTPException as err:
+            log.info("another-pick could not resolve channel=%s: %s", payload.channel_id, err)
+            return
+    if not channel_ok(channel):
+        log.info("another-pick refused by the age gate: channel=%s", payload.channel_id)
+        return
+
+    chain = REC_CARDS.get(payload.message_id)
+    if chain is None:
+        try:
+            original = await channel.fetch_message(payload.message_id)
+        except discord.HTTPException:
+            return
+        if client.user is None or original.author.id != client.user.id:
+            return  # someone else's message wearing the same emoji
+        await say_under_card(channel, payload.message_id, "Lost track of what that ask was. Run /rec again and I'll pick it back up.")
+        return
+
+    try:
+        answer = await ask_rec(chain["ask"], payload.user_id, payload.guild_id, exclude=chain["shown"])
+    except RateLimited:
+        await say_under_card(channel, payload.message_id, "Easy. Give it a few minutes and tap again.")
+        return
+    except (Unavailable, asyncio.TimeoutError, aiohttp.ClientError):
+        await say_under_card(channel, payload.message_id, "Couldn't pull up another one just now. Try again in a bit.")
+        return
+
+    if answer["tier"] != "rec" or not answer.get("strain"):
+        # All shown, or nothing fits any more: the site's line, under the card.
+        await say_under_card(channel, payload.message_id, answer["reply"])
+        return
+
+    content = f"Another pick for: {discord.utils.escape_mentions(discord.utils.escape_markdown(chain['ask']))}"
+    embed = rec_card(answer, chain["ask"])
+    message = None
+    try:
+        original = await channel.fetch_message(payload.message_id)
+        message = await original.reply(content=content, embed=embed, mention_author=False,
+                                       allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        try:
+            message = await channel.send(content=content, embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as err:
+            log.info("could not post another pick: %s", err)
+            return
+
+    chain["shown"].append(answer["strain"])
+    try:
+        await message.add_reaction(REC_EMOJI)
+        remember_rec(message, chain)
+    except discord.HTTPException as err:
+        log.info("could not add the another-pick reaction: %s", err)
+    log.info("another pick guild=%s user=%s strain=%s shown=%d", payload.guild_id, payload.user_id, answer["strain"], len(chain["shown"]))
+
+
 # ---------------------------------------------------------------- reaction
 
 async def say_under_card(channel, message_id: int, text: str) -> None:
@@ -699,6 +898,15 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         str(payload.emoji), [hex(ord(c)) for c in str(payload.emoji)],
         payload.user_id, payload.message_id, payload.channel_id,
     )
+
+    if same_emoji(payload.emoji, REC_EMOJI):
+        if client.user is not None and payload.user_id == client.user.id:
+            return  # the bot adding its own 🔄
+        try:
+            await _handle_another_rec(payload)
+        except Exception:
+            log.exception("another-pick blew up: message_id=%s", payload.message_id)
+        return
 
     if not same_emoji(payload.emoji, MORE_EMOJI):
         # Logged ONLY when it lands on one of our own cards. A busy channel is
@@ -951,6 +1159,11 @@ async def call_api(path: str, payload: dict):
 def is_host(user) -> bool:
     """The owner check. By user id only, never roles or permissions."""
     return bool(OWNER_DISCORD_ID) and getattr(user, "id", None) == OWNER_DISCORD_ID
+
+
+def is_admin(user) -> bool:
+    """/drop-entries viewers: ADMIN_DISCORD_IDS plus the host. By user id only."""
+    return is_host(user) or getattr(user, "id", None) in ADMIN_DISCORD_IDS
 
 
 def link_view(url: str) -> discord.ui.View:
@@ -1298,7 +1511,90 @@ def start_nudge_loop() -> None:
         nudge_task = asyncio.get_running_loop().create_task(nudge_loop())
 
 
+
+# /drop-entries: who's in this server's current drop and with how many
+# entries. READ ONLY. The site counts through the same function the draw
+# picks from, so this list is the draw pool. Hidden from members by default
+# (Manage Server), and the user id is checked here and again by the site.
+DISCORD_MESSAGE_MAX = 2000
+
+
+def entries_report(data: dict):
+    """(text, csv_or_None). The CSV only when the list won't fit in one message."""
+    round_ = data.get("round") or {}
+    entrants = data.get("entrants") or []
+    head = [
+        f"{ENTER_EMOJI} **Moai Drop entries** ({round_.get('status', '?')})",
+        f"Drop: {data.get('dates_label', '?')} · draw {data.get('draw_label', '?')}",
+        f"{data.get('total_people', 0)} entrants · {data.get('total_entries', 0)} entries",
+    ]
+    extra = []
+    if data.get("not_counted"):
+        extra.append(f"{data['not_counted']} tapped Enter but aren't counted (not linked yet, or a staff account)")
+    if data.get("left"):
+        extra.append(f"{data['left']} left this week")
+    if extra:
+        head.append(" · ".join(extra))
+
+    def name(e):
+        return safe_name(e.get("discord_name") or "unknown")
+
+    rows = [
+        f"{i}. {name(e)} ({safe_name(e.get('username') or 'no username')}): "
+        f"link {e.get('link_entry', 1)} + {e.get('days', 0)} days = **{e.get('total', 0)}**"
+        for i, e in enumerate(entrants, 1)
+    ]
+    text = "\n".join(head + ([""] + rows if rows else ["", "Nobody counted yet."]))
+    if len(text) <= DISCORD_MESSAGE_MAX:
+        return text, None
+
+    import csv
+    import io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["discord_name", "stonehead_username", "link_entry", "days_used", "total"])
+    for e in entrants:
+        writer.writerow([e.get("discord_name") or "", e.get("username") or "",
+                         e.get("link_entry", 1), e.get("days", 0), e.get("total", 0)])
+    summary = "\n".join(head + ["", "Full list attached as a .csv."])
+    return summary, buf.getvalue()
+
+
+@app_commands.command(name="drop-entries", description="See everyone in this week's Moai Drop (admins)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def drop_entries(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(NOT_HOST, ephemeral=True)
+        log.info("non-admin tried /drop-entries user=%s guild=%s", interaction.user.id, interaction.guild_id)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        status, data = await call_api("bot-round-entries", {
+            "invoker_discord_id": str(interaction.user.id),
+            "guild_id": str(interaction.guild_id),
+        })
+    except Unavailable:
+        status, data = 0, {}
+    if status != 200 or data.get("status") not in ("ok", "no_round"):
+        await interaction.followup.send(data.get("message") or "Couldn't load entries. Try again in a minute.", ephemeral=True)
+        return
+    if data["status"] == "no_round":
+        await interaction.followup.send(data.get("message") or "No Moai Drop in this server yet.", ephemeral=True)
+        return
+    text, csv_text = entries_report(data)
+    if csv_text is None:
+        await interaction.followup.send(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    else:
+        import io
+        file = discord.File(io.BytesIO(csv_text.encode("utf-8")), filename="moai-drop-entries.csv")
+        await interaction.followup.send(text, file=file, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
 if GIVEAWAY_GUILD_IDS:
+    tree.add_command(
+        drop_entries,
+        guilds=[discord.Object(id=g) for g in GIVEAWAY_GUILD_IDS],
+    )
     tree.add_command(
         Giveaway(name="giveaway", description="Run the Weekly Moai Drop (host only)"),
         guilds=[discord.Object(id=g) for g in GIVEAWAY_GUILD_IDS],
@@ -1327,8 +1623,8 @@ async def on_ready():
         commands_synced = True
     start_nudge_loop()
     log.info(
-        "connected as %s — in %d servers — build %s — intents(reactions=%s, guilds=%s)",
-        client.user, len(client.guilds), BUILD,
+        "connected as %s — in %d servers — v%s (build %s) — intents(reactions=%s, guilds=%s)",
+        client.user, len(client.guilds), VERSION, BUILD,
         intents.reactions, intents.guilds,
     )
 

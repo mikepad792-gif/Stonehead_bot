@@ -17,6 +17,27 @@ with a close profile. **The strain is chosen server-side from a precomputed
 table, never by the model** — a model asked for "something similar" reliably
 names a strain that was never in the database.
 
+## /rec
+
+`/rec looking_for:<text>`, like "something chill for a movie night" or
+"fruity, not too sleepy", posts one strain on the same card as `/strain`
+(name, StoneHead's take, type, effects, flavour, rating), under a line that
+keeps the ask visible: **Chaos** asked: something good for a lazy Sunday.
+Tapping 🔄 on the card posts another strain for the same ask under it, never
+one already shown in that chain, until the fits run out. (🔄 is "another
+pick"; 🔁 on `/strain` cards is still "more like this strain".)
+
+**The strain comes from the database, on the site** (`lib/strainRec.js` in the
+StoneHead repo), matched on effects, flavors and type, with "not"/"no"/"nothing"
+turning a word into a hard filter. The model only writes about the strain it was
+handed; it never chooses one, so it can't invent one. Too vague ("something
+good"), nothing that fits, or only a "where can I buy" gets a fixed line
+instead, with no model call and no hit on the hourly limit. Health asks get the
+effects people commonly report and a plain "can't speak to treating that";
+nothing is ever presented as treatment, and nothing ever points to where to get
+it. Same age gate and the same hourly limits as `/strain` (it's a mode on the
+same endpoint), and each 🔄 counts against the tapper's.
+
 ## The Weekly Moai Drop
 
 Three more commands, all answered privately (only the person sees the reply):
@@ -38,6 +59,14 @@ Three more commands, all answered privately (only the person sees the reply):
 3. `/giveaway` is registered as a guild command only in the servers in
    `GIVEAWAY_GUILD_IDS`, never globally. No other server sees it.
 
+**`/drop-entries`** (admins) lists everyone counted in this server's current
+drop, privately: dates, draw time, totals, and one row per person (Discord
+name, StoneHead username, link entry, days used, total), sorted by total. It
+reads the same count the draw uses, so it is the draw pool. Too long for one
+message, it comes as a .csv. It is hidden from members unless they have Manage
+Server (a server can change that under Server Settings, Integrations), and the
+user ID is checked against `ADMIN_DISCORD_IDS` by the bot and by the site.
+
 `start` posts the round in the (age-restricted) channel it's run in. `draw`
 asks the site to pick the winner (the site counts the entries, picks with a
 crypto random number, grants the pass days, and locks the round), greys out the
@@ -49,6 +78,22 @@ untagged line if anyone tapped Enter without finishing linking.
 
 The bot keeps none of this. Entries, links and the draw all live on the site
 (migration 024 in the StoneHead repo); the bot only relays.
+
+## Versions
+
+The bot has its own version number, separate from the StoneHead app. It's in
+`VERSION` at the top of `stonehead_bot.py` and in the console when the bot
+connects (`connected as ... v1.2.0 (build ...)`), so you can tell what's
+actually running after a restart. A new command or feature is a minor bump; a
+fix is a patch.
+
+- **1.2.0** (Oct 20, 2026): `/rec`, a strain pick for what you're in the mood
+  for (🔄 for another), and `/drop-entries`, the admin-only list of who's in the current Moai
+  Drop. Needs StoneHead 2.2.1 and `ADMIN_DISCORD_IDS`.
+- **1.1.0** (Oct 11, 2026): the Weekly Moai Drop. `/link`, the 🗿 Enter
+  button, `/entries`, and host-only `/giveaway`. Needs StoneHead 2.2.0.
+- **1.0.0** (Sept 2026): `/strain`, the family picker, and the 🔁 more-like-this
+  button.
 
 ## How it fits together
 
@@ -207,6 +252,7 @@ press, and a reaction the bot answers itself are all silent failures.
 | `LOG_REACTIONS` | Optional. `1` prints every raw reaction event the process receives, with code points. For debugging the 🔁 button; noisy in a busy channel. |
 | `REQUIRE_AGE_RESTRICTED` | Optional. Defaults to on. `0` disables the age gate — testing only. |
 | `OWNER_DISCORD_ID` | Moai Drop host. The one Discord user ID that can run `/giveaway`. Unset means nobody. Must match the site's `OWNER_DISCORD_ID`. |
+| `ADMIN_DISCORD_IDS` | Who can run `/drop-entries`, comma-separated Discord user IDs. The host (`OWNER_DISCORD_ID`) always can. Only controls who can read the list; admins enter and win like anyone else. |
 | `GIVEAWAY_GUILD_IDS` | Servers where `/giveaway` is registered, comma-separated. Unset means `/giveaway` doesn't exist anywhere. Must match the site's. |
 | `STONEHEAD_API_URL` | Optional. Base for the linking and Moai Drop endpoints. Defaults to `STONEHEAD_API` without `/strain-lookup`. |
 
