@@ -769,8 +769,8 @@ OWNER = 1520166782013542422
 check("M1 API base is the lookup URL minus /strain-lookup", B.API_BASE == "https://stoneheadai.com/api", B.API_BASE)
 check("M1 owner and giveaway servers come from the environment",
       B.OWNER_DISCORD_ID == OWNER and B.GIVEAWAY_GUILD_IDS == [788166388250443846])
-check("M2 /link and /entries are global; /giveaway is not",
-      sorted(c.name for c in B.tree.get_commands()) == ["entries", "link", "strain"],
+check("M2 /link, /entries and /rec are global; /giveaway is not",
+      sorted(c.name for c in B.tree.get_commands()) == ["entries", "link", "rec", "strain"],
       [c.name for c in B.tree.get_commands()])
 check("M2 /giveaway and /drop-entries exist only in the allowed server",
       sorted(c.name for c in B.tree.get_commands(guild=discord.Object(id=788166388250443846))) == ["drop-entries", "giveaway"]
@@ -1042,6 +1042,60 @@ admin = FakeInteraction(user_id=OWNER)
 run(de.callback(admin))
 check("D5 no round says so", "No Moai Drop" in (admin.followup.sent[0]["content"] or ""))
 B.call_api = real_call_api
+
+# ── /rec ────────────────────────────────────────────────────────────
+print("\n/rec")
+REC_ANSWER = {
+    "reply": "Three for a couch night. Granddaddy Purple is the heavy one.",
+    "matched": False, "strain": None, "tier": "rec", "fit": "good",
+    "picks": [
+        {"strain": "Granddaddy-Purple", "strain_data": {"type": "indica", "effects": ["Relaxed", "Sleepy", "Happy"], "flavor": ["Grape", "Berry", "Sweet"], "rating": 4.4}},
+        {"strain": "Blue-Dream", "strain_data": {"type": "hybrid", "effects": ["Relaxed", "Happy"], "flavor": ["Berry", "Sweet"], "rating": 4.4}},
+    ],
+}
+rec_cmd = B.tree.get_command("rec")
+fs = fresh_session(200, REC_ANSWER)
+inter = FakeInteraction(user_id=42)
+run(rec_cmd.callback(inter, "  something chill for a movie night  "))
+sent = inter.followup.sent[0] if inter.followup.sent else {}
+emb = sent.get("embed")
+check("R1 /rec sends mode rec with the trimmed ask, through the same endpoint and secret",
+      fs.requests == [{"mode": "rec", "query": "something chill for a movie night", "discord_user_id": "42", "guild_id": "7"}]
+      and fs.urls == [B.API_URL], fs.requests)
+check("R2 the reply is a /strain-style card: description, a field per pick, the same footer",
+      emb is not None and emb.description.startswith("Three for a couch night")
+      and [f.name for f in emb.fields] == ["Granddaddy Purple", "Blue Dream"]
+      and emb.fields[0].value == "Indica · Relaxed, Sleepy, Happy · Grape, Berry, Sweet"
+      and emb.footer.text == "StoneHead AI · full conversations at stoneheadai.com"
+      and emb.title == "Picks for: something chill for a movie night", emb and emb.to_dict())
+check("R2 no 🔁 on a picks card (it's not one strain)", inter.followup.sent and not getattr(sent, "reactions", None))
+
+fs = fresh_session(200, REC_ANSWER)
+inter = FakeInteraction()
+inter.channel = FakeChannel(nsfw=False)
+run(rec_cmd.callback(inter, "something chill"))
+check("R3 same age gate as /strain: refused outside age-restricted channels, site not called",
+      fs.requests == [] and inter.response.messages and inter.response.messages[0]["ephemeral"])
+
+fs = fresh_session(429, {})
+inter = FakeInteraction()
+run(rec_cmd.callback(inter, "something chill"))
+check("R4 over the shared /strain limit: the same easy-does-it line, privately",
+      inter.followup.sent[0]["content"] == "Easy. Give it a few minutes and ask again." and inter.followup.sent[0]["ephemeral"])
+
+fs = fresh_session(200, {"reply": "Give me a little more to go on.", "tier": "rec_vague", "picks": []})
+inter = FakeInteraction()
+run(rec_cmd.callback(inter, "something good"))
+emb = inter.followup.sent[0]["embed"]
+check("R5 a fixed site line (vague, nothing fits, no sourcing) renders as a card with no fields",
+      emb.description == "Give me a little more to go on." and len(emb.fields) == 0)
+
+fs = fresh_session(200, REC_ANSWER)
+for bad in ["   ", "x" * 201]:
+    inter = FakeInteraction()
+    run(rec_cmd.callback(inter, bad))
+    check(f"R6 {'blank' if not bad.strip() else 'too long'} is refused before the site is asked",
+          fs.requests == [] and inter.response.messages and inter.response.messages[0]["ephemeral"])
 
 print()
 if FAILURES:

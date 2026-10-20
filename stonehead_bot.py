@@ -106,7 +106,7 @@ VERSION = "1.2.0"
 # "restart" on a Pterodactyl panel reboots the process with whatever files are
 # already on disk — it does not pull. Without this there is no way to tell a
 # deployed fix from an undeployed one except by guessing at behaviour.
-BUILD = "2026-10-19-drop-entries"
+BUILD = "2026-10-20-rec"
 
 GREEN = 0x4A7C4E
 
@@ -659,6 +659,110 @@ async def strain(interaction: discord.Interaction, name: str):
         "strain lookup guild=%s user=%s query=%r tier=%s matched=%s answered=%s",
         interaction.guild_id, interaction.user.id, name,
         answer["tier"], answer["matched"], answered,
+    )
+
+
+# ---------------------------------------------------------------- /rec
+
+async def ask_rec(looking_for: str, user_id, guild_id):
+    """POST mode "rec". Returns {reply, tier, picks}, or raises.
+
+    The PICKS are made on the site, from the database, by effects and flavors.
+    The bot never chooses a strain; it renders what comes back.
+    """
+    assert session is not None
+    payload = {
+        "mode": "rec",
+        "query": looking_for,
+        "discord_user_id": str(user_id),
+        "guild_id": str(guild_id) if guild_id else None,
+    }
+    headers = {"X-Bot-Secret": BOT_SECRET, "Content-Type": "application/json"}
+    async with session.post(
+        API_URL,
+        json=payload,
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+    ) as res:
+        if res.status == 429:
+            raise RateLimited()
+        if res.status == 401:
+            log.error("endpoint rejected the shared secret — check STONEHEAD_BOT_SECRET")
+            raise Unavailable()
+        if res.status != 200:
+            body = (await res.text())[:200]
+            log.error("rec failed status=%s body=%s", res.status, body)
+            raise Unavailable()
+        data = await res.json()
+        reply = (data.get("reply") or "").strip()
+        if not reply:
+            raise Unavailable()
+        return {"reply": reply, "tier": data.get("tier"), "picks": data.get("picks") or []}
+
+
+def pick_field(strain_data) -> str:
+    """'Hybrid · Relaxed, Happy, Euphoric · Berry, Sweet' for a pick's field."""
+    parts = []
+    kind = (strain_data or {}).get("type")
+    if kind:
+        parts.append(str(kind).capitalize())
+    for key in ("effects", "flavor"):
+        value = (strain_data or {}).get(key)
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(v) for v in value[:4] if str(v).strip())
+        if value:
+            parts.append(str(value))
+    return " · ".join(parts) or "In the notes"
+
+
+def rec_embed(answer: dict, looking_for: str) -> discord.Embed:
+    """The /strain card, with one field per pick instead of one strain's fields."""
+    title = f"Picks for: {looking_for}"
+    embed = card_embed(answer["reply"], None, None, fallback_title=title[:256])
+    for pick in answer["picks"][:3]:
+        name = pick.get("strain")
+        if name:
+            embed.add_field(name=strain_title(name), value=pick_field(pick.get("strain_data"))[:1024], inline=False)
+    return embed
+
+
+@tree.command(name="rec", description="Get a few strain picks for what you're in the mood for")
+@app_commands.describe(looking_for="e.g. something chill for a movie night, or fruity, not too sleepy")
+async def rec(interaction: discord.Interaction, looking_for: str):
+    if not channel_allows(interaction):
+        await interaction.response.send_message(
+            "This one only works in age-restricted channels. A mod can flag a "
+            "channel 18+ in its settings.",
+            ephemeral=True,
+        )
+        return
+
+    looking_for = looking_for.strip()
+    if not looking_for:
+        await interaction.response.send_message("Tell me what you're in the mood for.", ephemeral=True)
+        return
+    if len(looking_for) > 200:
+        await interaction.response.send_message("That's a long one, shorten it up.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        answer = await ask_rec(looking_for, interaction.user.id, interaction.guild_id)
+    except RateLimited:
+        await interaction.followup.send("Easy. Give it a few minutes and ask again.", ephemeral=True)
+        return
+    except (Unavailable, asyncio.TimeoutError, aiohttp.ClientError):
+        await interaction.followup.send(
+            f"He's not answering right now. Try again in a bit, or come find him at {SITE_URL}",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(embed=rec_embed(answer, looking_for), wait=True)
+    log.info(
+        "rec guild=%s user=%s tier=%s picks=%s",
+        interaction.guild_id, interaction.user.id, answer["tier"],
+        [p.get("strain") for p in answer["picks"]],
     )
 
 
