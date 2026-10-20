@@ -20,19 +20,23 @@ names a strain that was never in the database.
 ## /rec
 
 `/rec looking_for:<text>`, like "something chill for a movie night" or
-"fruity, not too sleepy", answers with the same card as `/strain`: a short
-reply and one field per pick (type, effects, flavor), 1 to 3 picks.
+"fruity, not too sleepy", posts one strain on the same card as `/strain`
+(name, StoneHead's take, type, effects, flavour, rating), under a line that
+keeps the ask visible: **Chaos** asked: something good for a lazy Sunday.
+Tapping 🔄 on the card posts another strain for the same ask under it, never
+one already shown in that chain, until the fits run out. (🔄 is "another
+pick"; 🔁 on `/strain` cards is still "more like this strain".)
 
-**The picks come from the database, on the site** (`lib/strainRec.js` in the
+**The strain comes from the database, on the site** (`lib/strainRec.js` in the
 StoneHead repo), matched on effects, flavors and type, with "not"/"no"/"nothing"
-turning a word into a hard filter. The model only writes a line about each
-strain it was handed; it never chooses one, so it can't invent one. Too vague
-("something good"), nothing that fits, or only a "where can I buy" gets a fixed
-line instead, with no model call and no hit on the hourly limit. Health asks
-get effects people commonly report and a plain "can't speak to treating that";
+turning a word into a hard filter. The model only writes about the strain it was
+handed; it never chooses one, so it can't invent one. Too vague ("something
+good"), nothing that fits, or only a "where can I buy" gets a fixed line
+instead, with no model call and no hit on the hourly limit. Health asks get the
+effects people commonly report and a plain "can't speak to treating that";
 nothing is ever presented as treatment, and nothing ever points to where to get
 it. Same age gate and the same hourly limits as `/strain` (it's a mode on the
-same endpoint).
+same endpoint), and each 🔄 counts against the tapper's.
 
 ## The Weekly Moai Drop
 
@@ -83,8 +87,8 @@ connects (`connected as ... v1.2.0 (build ...)`), so you can tell what's
 actually running after a restart. A new command or feature is a minor bump; a
 fix is a patch.
 
-- **1.2.0** (Oct 20, 2026): `/rec`, strain picks for what you're in the mood
-  for, and `/drop-entries`, the admin-only list of who's in the current Moai
+- **1.2.0** (Oct 20, 2026): `/rec`, a strain pick for what you're in the mood
+  for (🔄 for another), and `/drop-entries`, the admin-only list of who's in the current Moai
   Drop. Needs StoneHead 2.2.1 and `ADMIN_DISCORD_IDS`.
 - **1.1.0** (Oct 11, 2026): the Weekly Moai Drop. `/link`, the 🗿 Enter
   button, `/entries`, and host-only `/giveaway`. Needs StoneHead 2.2.0.

@@ -95,7 +95,7 @@ class FakeMessage:
     async def add_reaction(self, emoji):
         self.reactions.append(emoji)
 
-    async def reply(self, content=None, embed=None, mention_author=None):
+    async def reply(self, content=None, embed=None, mention_author=None, **kw):
         child = FakeMessage()
         self.replies.append({"content": content, "embed": embed, "message": child})
         return child
@@ -1045,56 +1045,105 @@ B.call_api = real_call_api
 
 # ── /rec ────────────────────────────────────────────────────────────
 print("\n/rec")
-REC_ANSWER = {
-    "reply": "Three for a couch night. Granddaddy Purple is the heavy one.",
-    "matched": False, "strain": None, "tier": "rec", "fit": "good",
-    "picks": [
-        {"strain": "Granddaddy-Purple", "strain_data": {"type": "indica", "effects": ["Relaxed", "Sleepy", "Happy"], "flavor": ["Grape", "Berry", "Sweet"], "rating": 4.4}},
-        {"strain": "Blue-Dream", "strain_data": {"type": "hybrid", "effects": ["Relaxed", "Happy"], "flavor": ["Berry", "Sweet"], "rating": 4.4}},
-    ],
-}
+GDP = {"reply": "Granddaddy Purple, the heavy one. Grape and berry, sinks you into the couch.",
+       "matched": True, "strain": "Granddaddy-Purple", "tier": "rec", "fit": "good",
+       "strain_data": {"type": "indica", "effects": ["Relaxed", "Sleepy", "Happy"], "flavor": ["Grape", "Berry", "Sweet"], "rating": 4.4}}
 rec_cmd = B.tree.get_command("rec")
-fs = fresh_session(200, REC_ANSWER)
+fs = fresh_session(200, GDP)
 inter = FakeInteraction(user_id=42)
-run(rec_cmd.callback(inter, "  something chill for a movie night  "))
+inter.user.display_name = "Chaos"
+run(rec_cmd.callback(inter, "  what's something good for a lazy Sunday  "))
 sent = inter.followup.sent[0] if inter.followup.sent else {}
 emb = sent.get("embed")
+fields = {f.name: f.value for f in emb.fields} if emb else {}
 check("R1 /rec sends mode rec with the trimmed ask, through the same endpoint and secret",
-      fs.requests == [{"mode": "rec", "query": "something chill for a movie night", "discord_user_id": "42", "guild_id": "7"}]
+      fs.requests == [{"mode": "rec", "query": "what's something good for a lazy Sunday", "discord_user_id": "42", "guild_id": "7"}]
       and fs.urls == [B.API_URL], fs.requests)
-check("R2 the reply is a /strain-style card: description, a field per pick, the same footer",
-      emb is not None and emb.description.startswith("Three for a couch night")
-      and [f.name for f in emb.fields] == ["Granddaddy Purple", "Blue Dream"]
-      and emb.fields[0].value == "Indica · Relaxed, Sleepy, Happy · Grape, Berry, Sweet"
-      and emb.footer.text == "StoneHead AI · full conversations at stoneheadai.com"
-      and emb.title == "Picks for: something chill for a movie night", emb and emb.to_dict())
-check("R2 no 🔁 on a picks card (it's not one strain)", inter.followup.sent and not getattr(sent, "reactions", None))
+check("R2 the ask stays visible: 'Chaos asked: ...' above the card",
+      sent.get("content") == "**Chaos** asked: what's something good for a lazy Sunday", sent.get("content"))
+check("R2 the card is a /strain card: strain name, StoneHead's take, type/effects/flavour/rating, same footer",
+      emb is not None and emb.title == "Granddaddy Purple" and emb.description.startswith("Granddaddy Purple, the heavy one")
+      and fields == {"Type": "indica", "Effects": "Relaxed, Sleepy, Happy", "Flavour": "Grape, Berry, Sweet", "Rating": "4.4/5"}
+      and emb.footer.text == "StoneHead AI · full conversations at stoneheadai.com", fields)
+card = FakeMessage()
+inter2 = FakeInteraction()
+inter2.user.display_name = "Chaos"
+async def _send(content=None, embed=None, wait=False, **kw):
+    card.content, card.embed = content, embed
+    return card
+inter2.followup.send = _send
+fs = fresh_session(200, GDP)
+run(rec_cmd.callback(inter2, "lazy sunday"))
+check("R3 the card carries 🔄 and remembers the ask and the strain shown",
+      card.reactions == [B.REC_EMOJI] and B.REC_CARDS.get(card.id) == {"ask": "lazy sunday", "shown": ["Granddaddy-Purple"]}, card.reactions)
+check("R3 🔄 is not 🔁 (that one means more like this strain)", not B.same_emoji(B.REC_EMOJI, B.MORE_EMOJI))
 
-fs = fresh_session(200, REC_ANSWER)
+check("R4 the asked line can't ping or format",
+      "@everyone" not in B.asked_line("x", "@everyone **free weed**") and "**free weed**" not in B.asked_line("x", "@everyone **free weed**"))
+
+# 🔄 tap: another strain for the same ask, excluding what's been shown, posted under the card.
+chan = FakeChannel()
+chan.messages[card.id] = card
+real_client = B.client
+B.client = FakeClient(chan)
+BD = dict(GDP, strain="Blue-Dream", reply="Blue Dream, the easy one.",
+          strain_data={"type": "hybrid", "effects": ["Relaxed", "Happy"], "flavor": ["Berry", "Sweet"], "rating": 4.4})
+fs = fresh_session(200, BD)
+run(B.on_raw_reaction_add(FakePayload(card.id, user_id=77, emoji=B.REC_EMOJI)))
+reply = card.replies[0] if card.replies else {}
+check("R5 🔄 asks again with the same ask, as the tapper, excluding what was shown",
+      fs.requests == [{"mode": "rec", "query": "lazy sunday", "discord_user_id": "77", "guild_id": "7", "exclude_strains": ["Granddaddy-Purple"]}], fs.requests)
+check("R5 the new pick lands under the card as a full card, with its own 🔄",
+      reply.get("content") == "Another pick for: lazy sunday" and reply.get("embed") is not None
+      and reply["embed"].title == "Blue Dream" and reply["message"].reactions == [B.REC_EMOJI], reply)
+check("R5 the chain remembers both, shared across its cards",
+      B.REC_CARDS.get(reply["message"].id) is B.REC_CARDS.get(card.id)
+      and B.REC_CARDS[card.id]["shown"] == ["Granddaddy-Purple", "Blue-Dream"])
+
+chan.messages[reply["message"].id] = reply["message"]
+fs = fresh_session(200, {"reply": "That's every strain in my notes that fits that ask. Try loosening it up or asking for something different.", "tier": "rec_all_shown", "strain": None})
+run(B.on_raw_reaction_add(FakePayload(reply["message"].id, user_id=77, emoji=B.REC_EMOJI)))
+chan_text = [r.get("content") for r in reply["message"].replies] + [m.get("content") for m in chan.sent]
+check("R6 out of picks: the site's line, no new card", any("every strain in my notes" in (t or "") for t in chan_text), chan_text)
+
+fs = fresh_session(200, BD)
+before = len(fs.requests)
+run(B.on_raw_reaction_add(FakePayload(card.id, user_id=555, emoji=B.REC_EMOJI)))
+check("R7 the bot's own 🔄 is ignored", fs.requests == [])
+
+nsfw_off = FakeChannel(nsfw=False)
+nsfw_off.messages[card.id] = card
+B.client = FakeClient(nsfw_off)
+fs = fresh_session(200, BD)
+run(B.on_raw_reaction_add(FakePayload(card.id, user_id=77, emoji=B.REC_EMOJI)))
+check("R8 🔄 in a channel that lost its age flag stays silent", fs.requests == [] and nsfw_off.sent == [])
+B.client = real_client
+
+fs = fresh_session(200, GDP)
 inter = FakeInteraction()
 inter.channel = FakeChannel(nsfw=False)
 run(rec_cmd.callback(inter, "something chill"))
-check("R3 same age gate as /strain: refused outside age-restricted channels, site not called",
-      fs.requests == [] and inter.response.messages and inter.response.messages[0]["ephemeral"])
+check("R9 same age gate as /strain", fs.requests == [] and inter.response.messages and inter.response.messages[0]["ephemeral"])
 
 fs = fresh_session(429, {})
 inter = FakeInteraction()
 run(rec_cmd.callback(inter, "something chill"))
-check("R4 over the shared /strain limit: the same easy-does-it line, privately",
+check("R10 over the shared /strain limit: the same easy-does-it line, privately",
       inter.followup.sent[0]["content"] == "Easy. Give it a few minutes and ask again." and inter.followup.sent[0]["ephemeral"])
 
-fs = fresh_session(200, {"reply": "Give me a little more to go on.", "tier": "rec_vague", "picks": []})
+fs = fresh_session(200, {"reply": "Give me a little more to go on.", "tier": "rec_vague", "strain": None, "strain_data": None})
 inter = FakeInteraction()
+inter.user.display_name = "Chaos"
 run(rec_cmd.callback(inter, "something good"))
 emb = inter.followup.sent[0]["embed"]
-check("R5 a fixed site line (vague, nothing fits, no sourcing) renders as a card with no fields",
-      emb.description == "Give me a little more to go on." and len(emb.fields) == 0)
+check("R11 a fixed site line (vague, nothing fits, no sourcing) still shows the ask, no fields",
+      inter.followup.sent[0]["content"] == "**Chaos** asked: something good" and emb.description == "Give me a little more to go on." and len(emb.fields) == 0)
 
-fs = fresh_session(200, REC_ANSWER)
+fs = fresh_session(200, GDP)
 for bad in ["   ", "x" * 201]:
     inter = FakeInteraction()
     run(rec_cmd.callback(inter, bad))
-    check(f"R6 {'blank' if not bad.strip() else 'too long'} is refused before the site is asked",
+    check(f"R12 {'blank' if not bad.strip() else 'too long'} is refused before the site is asked",
           fs.requests == [] and inter.response.messages and inter.response.messages[0]["ephemeral"])
 
 print()

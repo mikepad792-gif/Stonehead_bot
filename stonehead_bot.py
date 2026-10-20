@@ -664,11 +664,28 @@ async def strain(interaction: discord.Interaction, name: str):
 
 # ---------------------------------------------------------------- /rec
 
-async def ask_rec(looking_for: str, user_id, guild_id):
-    """POST mode "rec". Returns {reply, tier, picks}, or raises.
+# The "another pick" button on a /rec card. Not 🔁: that one already means
+# "more like THIS strain" on /strain cards, and this means "another one for
+# the same ask".
+REC_EMOJI = "\U0001F504"  # 🔄
 
-    The PICKS are made on the site, from the database, by effects and flavors.
-    The bot never chooses a strain; it renders what comes back.
+# What each /rec card was asked, and every strain shown along that chain, so
+# 🔄 never repeats one. Cards in the same chain share one dict. In memory like
+# CARD_STRAINS: a restart costs a dead 🔄 on old cards, nothing more.
+REC_CARDS: "OrderedDict[int, dict]" = OrderedDict()
+
+
+def remember_rec(message, chain: dict) -> None:
+    REC_CARDS[message.id] = chain
+    while len(REC_CARDS) > CARD_MEMORY:
+        REC_CARDS.popitem(last=False)
+
+
+async def ask_rec(looking_for: str, user_id, guild_id, exclude=None):
+    """POST mode "rec". Returns {reply, tier, strain, strain_data}, or raises.
+
+    The site picks the strain, from the database, by effects and flavors; the
+    bot never chooses one. `exclude` is every strain already shown for this ask.
     """
     assert session is not None
     payload = {
@@ -677,6 +694,8 @@ async def ask_rec(looking_for: str, user_id, guild_id):
         "discord_user_id": str(user_id),
         "guild_id": str(guild_id) if guild_id else None,
     }
+    if exclude:
+        payload["exclude_strains"] = list(exclude)[-50:]
     headers = {"X-Bot-Secret": BOT_SECRET, "Content-Type": "application/json"}
     async with session.post(
         API_URL,
@@ -697,36 +716,30 @@ async def ask_rec(looking_for: str, user_id, guild_id):
         reply = (data.get("reply") or "").strip()
         if not reply:
             raise Unavailable()
-        return {"reply": reply, "tier": data.get("tier"), "picks": data.get("picks") or []}
+        return {
+            "reply": reply,
+            "tier": data.get("tier"),
+            "strain": data.get("strain"),
+            "strain_data": data.get("strain_data"),
+        }
 
 
-def pick_field(strain_data) -> str:
-    """'Hybrid · Relaxed, Happy, Euphoric · Berry, Sweet' for a pick's field."""
-    parts = []
-    kind = (strain_data or {}).get("type")
-    if kind:
-        parts.append(str(kind).capitalize())
-    for key in ("effects", "flavor"):
-        value = (strain_data or {}).get(key)
-        if isinstance(value, (list, tuple)):
-            value = ", ".join(str(v) for v in value[:4] if str(v).strip())
-        if value:
-            parts.append(str(value))
-    return " · ".join(parts) or "In the notes"
+def asked_line(name, looking_for: str) -> str:
+    """'**Chaos** asked: something good for a lazy Sunday', safe to post.
+
+    A slash command's options don't show in the channel, so without this the
+    card answers a question nobody else can see.
+    """
+    ask = discord.utils.escape_mentions(discord.utils.escape_markdown(looking_for))
+    return f"**{safe_name(name)}** asked: {ask}"
 
 
-def rec_embed(answer: dict, looking_for: str) -> discord.Embed:
-    """The /strain card, with one field per pick instead of one strain's fields."""
-    title = f"Picks for: {looking_for}"
-    embed = card_embed(answer["reply"], None, None, fallback_title=title[:256])
-    for pick in answer["picks"][:3]:
-        name = pick.get("strain")
-        if name:
-            embed.add_field(name=strain_title(name), value=pick_field(pick.get("strain_data"))[:1024], inline=False)
-    return embed
+def rec_card(answer: dict, looking_for: str) -> discord.Embed:
+    """Exactly a /strain card: the strain's name, StoneHead's take, its fields."""
+    return card_embed(answer["reply"], answer.get("strain"), answer.get("strain_data"), fallback_title=looking_for[:256])
 
 
-@tree.command(name="rec", description="Get a few strain picks for what you're in the mood for")
+@tree.command(name="rec", description="Get a strain pick for what you're in the mood for")
 @app_commands.describe(looking_for="e.g. something chill for a movie night, or fruity, not too sleepy")
 async def rec(interaction: discord.Interaction, looking_for: str):
     if not channel_allows(interaction):
@@ -758,12 +771,82 @@ async def rec(interaction: discord.Interaction, looking_for: str):
         )
         return
 
-    await interaction.followup.send(embed=rec_embed(answer, looking_for), wait=True)
-    log.info(
-        "rec guild=%s user=%s tier=%s picks=%s",
-        interaction.guild_id, interaction.user.id, answer["tier"],
-        [p.get("strain") for p in answer["picks"]],
+    message = await interaction.followup.send(
+        content=asked_line(interaction.user.display_name, looking_for),
+        embed=rec_card(answer, looking_for),
+        allowed_mentions=discord.AllowedMentions.none(),
+        wait=True,
     )
+    # 🔄 only on a real pick. A "tell me more" or "nothing fits" line has no
+    # next pick to offer.
+    if answer["tier"] == "rec" and answer.get("strain"):
+        try:
+            await message.add_reaction(REC_EMOJI)
+            remember_rec(message, {"ask": looking_for, "shown": [answer["strain"]]})
+        except discord.HTTPException as err:
+            log.info("could not add the another-pick reaction: %s", err)
+    log.info("rec guild=%s user=%s tier=%s strain=%s", interaction.guild_id, interaction.user.id, answer["tier"], answer.get("strain"))
+
+
+async def _handle_another_rec(payload: discord.RawReactionActionEvent):
+    """🔄 on a /rec card: another strain for the same ask, never one already shown."""
+    channel = client.get_channel(payload.channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(payload.channel_id)
+        except discord.HTTPException as err:
+            log.info("another-pick could not resolve channel=%s: %s", payload.channel_id, err)
+            return
+    if not channel_ok(channel):
+        log.info("another-pick refused by the age gate: channel=%s", payload.channel_id)
+        return
+
+    chain = REC_CARDS.get(payload.message_id)
+    if chain is None:
+        try:
+            original = await channel.fetch_message(payload.message_id)
+        except discord.HTTPException:
+            return
+        if client.user is None or original.author.id != client.user.id:
+            return  # someone else's message wearing the same emoji
+        await say_under_card(channel, payload.message_id, "Lost track of what that ask was. Run /rec again and I'll pick it back up.")
+        return
+
+    try:
+        answer = await ask_rec(chain["ask"], payload.user_id, payload.guild_id, exclude=chain["shown"])
+    except RateLimited:
+        await say_under_card(channel, payload.message_id, "Easy. Give it a few minutes and tap again.")
+        return
+    except (Unavailable, asyncio.TimeoutError, aiohttp.ClientError):
+        await say_under_card(channel, payload.message_id, "Couldn't pull up another one just now. Try again in a bit.")
+        return
+
+    if answer["tier"] != "rec" or not answer.get("strain"):
+        # All shown, or nothing fits any more: the site's line, under the card.
+        await say_under_card(channel, payload.message_id, answer["reply"])
+        return
+
+    content = f"Another pick for: {discord.utils.escape_mentions(discord.utils.escape_markdown(chain['ask']))}"
+    embed = rec_card(answer, chain["ask"])
+    message = None
+    try:
+        original = await channel.fetch_message(payload.message_id)
+        message = await original.reply(content=content, embed=embed, mention_author=False,
+                                       allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException:
+        try:
+            message = await channel.send(content=content, embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as err:
+            log.info("could not post another pick: %s", err)
+            return
+
+    chain["shown"].append(answer["strain"])
+    try:
+        await message.add_reaction(REC_EMOJI)
+        remember_rec(message, chain)
+    except discord.HTTPException as err:
+        log.info("could not add the another-pick reaction: %s", err)
+    log.info("another pick guild=%s user=%s strain=%s shown=%d", payload.guild_id, payload.user_id, answer["strain"], len(chain["shown"]))
 
 
 # ---------------------------------------------------------------- reaction
@@ -815,6 +898,15 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         str(payload.emoji), [hex(ord(c)) for c in str(payload.emoji)],
         payload.user_id, payload.message_id, payload.channel_id,
     )
+
+    if same_emoji(payload.emoji, REC_EMOJI):
+        if client.user is not None and payload.user_id == client.user.id:
+            return  # the bot adding its own 🔄
+        try:
+            await _handle_another_rec(payload)
+        except Exception:
+            log.exception("another-pick blew up: message_id=%s", payload.message_id)
+        return
 
     if not same_emoji(payload.emoji, MORE_EMOJI):
         # Logged ONLY when it lands on one of our own cards. A busy channel is
